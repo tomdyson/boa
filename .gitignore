@@ -1,0 +1,7 @@
+# Local Worker state and local-only secrets
+worker/.wrangler/
+worker/.dev.vars
+node_modules/
+.DS_Store
+# Built by `boa push`
+app.css

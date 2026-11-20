@@ -1,0 +1,30 @@
+# boa: one Worker that serves every app. No account id or domain here on purpose:
+# `boa setup` deploys to whichever Cloudflare account Wrangler is signed in to.
+name = "boa"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# The browser library and Alpine.js are served as text, the fonts as bytes: none are bundled as code.
+[[rules]]
+type = "Text"
+globs = ["**/*.client.js"]
+fallthrough = true
+
+[[rules]]
+type = "Data"
+globs = ["**/*.woff2"]
+fallthrough = true
+
+[[durable_objects.bindings]]
+name = "APP"
+class_name = "AppStore"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+# Append-only: never edit or remove a tag that has been deployed.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AppStore", "Registry"]

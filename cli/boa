@@ -1,0 +1,637 @@
+#!/usr/bin/env node
+"use strict";
+// boa — small web apps on your own Cloudflare account. One file, no packages.
+//
+// Settings and secrets live in ~/.config/boa/ (readable only by you). This file never prints them.
+// --local sends any command to a Worker running on this computer (`boa dev`) instead of the real one.
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const http = require("node:http");
+const https = require("node:https");
+const crypto = require("node:crypto");
+const readline = require("node:readline");
+const { spawnSync } = require("node:child_process");
+
+const REPO = path.resolve(__dirname, "..");
+const WORKER = path.join(REPO, "worker");
+const CONFIG_DIR = process.env.BOA_CONFIG_DIR || path.join(os.homedir(), ".config", "boa");
+const CONFIG = path.join(CONFIG_DIR, "config.json");
+const PASSWORDS = path.join(CONFIG_DIR, "passwords.json");
+const LOCAL_PORT = Number(process.env.BOA_LOCAL_PORT) || 8798;
+const LOCAL_BASE = `http://127.0.0.1:${LOCAL_PORT}`;
+// Pinned, so everyone runs the same tools. Change them here and nowhere else.
+const WRANGLER = "wrangler@4.166.0";
+const TAILWIND = "@tailwindcss/cli@4.3.5";
+const VERSION = (fs.readFileSync(path.join(WORKER, "src", "version.js"), "utf8").match(/VERSION = "([^"]+)"/) || [])[1] || "?";
+const USER_AGENT = `boa-cli/${VERSION}`;
+const PIECE_BYTES = 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const IMAGE_WARN_BYTES = 1_500_000;
+const SKIP_FILES = new Set(["input.css", ".DS_Store", "Thumbs.db"]);
+const SKIP_DIRS = new Set(["node_modules", "exports"]);
+const RESERVED = new Set(["boa", "boa-exports", "boa-backups"]);
+const TYPES = {
+  ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json",
+  ".csv": "text/csv", ".txt": "text/plain", ".md": "text/markdown", ".xml": "application/xml", ".svg": "image/svg+xml",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+  ".ico": "image/x-icon", ".pdf": "application/pdf", ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf", ".otf": "font/otf",
+  ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".mp4": "video/mp4", ".webm": "video/webm",
+  ".webmanifest": "application/manifest+json",
+};
+const TEXT_TYPES = /^(text\/|application\/(json|xml|manifest\+json)|image\/svg\+xml)/;
+
+// Short, common, unambiguous words (no UK/US spelling splits): easy to read out or type.
+const WORDS = `amber anchor apple apricot arrow aspen autumn badger bamboo banjo barley basil beacon beaver birch
+biscuit bison blossom bramble breeze bridge brook bucket buffalo butter cabin cactus camel candle canoe canyon
+carrot castle cedar cello cherry chestnut cider cinder citrus clover cobalt comet copper coral cotton cougar
+coyote crane crater cricket crystal cypress daisy delta desert dolphin dove dragon drum eagle easel ember falcon
+fennel fern fiddle finch flame flint fossil fox garden garnet gecko ginger glacier goose granite grape gravel
+hazel heron hickory honey hornet husky iris island ivory jackal jasmine jasper juniper kayak kettle kiwi koala
+ladder lagoon lantern larch lemon lilac lily linen lizard llama lotus magnet mango maple marble meadow melon
+mint mirror moose moss nectar nutmeg oak oasis ocean olive onion orchid otter owl paddle panda panther papaya
+parrot peach pebble pecan pelican pepper piano pine plum pony poppy prairie puffin quail quartz quill rabbit
+radish raven reef ribbon river robin rocket rose ruby saddle saffron sage salmon satin shadow shell sierra
+silver sparrow spruce squid squirrel starling stone summit swan tango thistle thunder tiger timber toffee topaz
+tulip tundra turnip turtle valley velvet violet walnut walrus willow window winter wolf wombat yak zebra`.split(/\s+/);
+
+class Stop extends Error {}
+function die(msg) {
+  throw new Stop(msg);
+}
+
+// --- settings on this computer ------------------------------------------------------------------
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+// Everything in the settings folder is private: the folder is 700, each file 600.
+function writePrivate(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, text, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+const loadConfig = () => readJson(CONFIG, {});
+const saveConfig = (cfg) => writePrivate(CONFIG, JSON.stringify(cfg, null, 2) + "\n");
+
+function readEnvFile(file) {
+  const out = {};
+  if (!fs.existsSync(file)) return out;
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, "");
+  }
+  return out;
+}
+
+// Where apps' page files live: the folder that holds the boa folder (~/Apps), unless setup was told otherwise.
+const appsDir = () => process.env.BOA_APPS_DIR || loadConfig().apps_dir || path.dirname(REPO);
+const exportsDir = () => path.join(appsDir(), "boa-exports");
+
+function passphrase() {
+  const word = () => WORDS[crypto.randomInt(WORDS.length)];
+  return `${word()}-${word()}-${word()}-${crypto.randomInt(10, 100)}`;
+}
+
+function savePassword(base, slug, password) {
+  const data = readJson(PASSWORDS, {});
+  if (password === null) delete data[`${base}/${slug}`];
+  else data[`${base}/${slug}`] = password;
+  writePrivate(PASSWORDS, JSON.stringify(data, null, 2) + "\n");
+}
+
+// 20261120-140502, in this computer's own time: for file names.
+function stampNow() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function when(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const month = d.toLocaleString("en-GB", { month: "short" });
+  return `${d.getDate()} ${month} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+// --- talking to the Worker ----------------------------------------------------------------------
+
+// If this computer can't find the address (a router remembering that it didn't exist a minute ago,
+// before the Worker was first put online), look it up through Cloudflare's DNS and use that.
+const pinned = {};
+async function pinAddress(host) {
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, { headers: { Accept: "application/dns-json" } });
+    const ip = ((await r.json()).Answer || []).find((a) => a.type === 1)?.data;
+    if (ip) pinned[host] = ip;
+    return Boolean(ip);
+  } catch {
+    return false;
+  }
+}
+
+function request(base, method, pathname, { headers = {}, body = null, timeout = 120000 } = {}) {
+  const u = new URL(base);
+  const secure = u.protocol === "https:";
+  const send = () =>
+    new Promise((resolve, reject) => {
+      const opts = { method, host: u.hostname, port: u.port || (secure ? 443 : 80), path: pathname, timeout, headers: { "User-Agent": USER_AGENT, ...headers } };
+      const ip = pinned[u.hostname];
+      if (ip) opts.lookup = (_h, o, cb) => (o && o.all ? cb(null, [{ address: ip, family: 4 }]) : cb(null, ip, 4));
+      if (body !== null) opts.headers["Content-Length"] = Buffer.byteLength(body);
+      const req = (secure ? https : http).request(opts, (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      });
+      req.on("timeout", () => req.destroy(new Error("no answer in time")));
+      req.on("error", reject);
+      req.end(body === null ? undefined : body);
+    });
+  return send().catch(async (e) => {
+    const isLocal = ["127.0.0.1", "localhost"].includes(u.hostname);
+    if (e.code === "ENOTFOUND" && !isLocal && !pinned[u.hostname] && (await pinAddress(u.hostname))) return send();
+    throw e;
+  });
+}
+
+class Client {
+  constructor(local) {
+    this.local = local;
+    if (local) {
+      this.base = LOCAL_BASE;
+      this.token = readEnvFile(path.join(WORKER, ".dev.vars")).ADMIN_TOKEN || die("the local Worker has never been started: run `boa dev` first");
+    } else {
+      const cfg = loadConfig();
+      this.base = (process.env.BOA_BASE_URL || cfg.base_url || "").replace(/\/+$/, "") || die("boa isn't set up on this computer yet: run `boa setup`");
+      this.token = process.env.BOA_ADMIN_TOKEN || cfg.admin_token || die("boa's settings are incomplete: run `boa setup`");
+    }
+  }
+
+  // Admin API call. `json` is sent as JSON; `data` (a Buffer) is sent as it is.
+  async call(method, pathname, { json, data = null, headers = {}, missingOk = false } = {}) {
+    const h = { Authorization: `Bearer ${this.token}`, ...headers };
+    let body = data;
+    if (json !== undefined) {
+      body = Buffer.from(JSON.stringify(json));
+      h["Content-Type"] = "application/json";
+    }
+    let res;
+    try {
+      res = await request(this.base, method, `/_admin${pathname}`, { headers: h, body });
+    } catch (e) {
+      die(`can't reach ${this.base} (${e.code || e.message})${this.local ? ": is `boa dev` running?" : ". Check the internet connection, then try `boa doctor`."}`);
+    }
+    const text = res.body.toString("utf8");
+    if (res.status >= 200 && res.status < 300) return text ? JSON.parse(text) : null;
+    if (missingOk && res.status === 404) return null;
+    let detail = text;
+    try {
+      detail = JSON.parse(text).error || text;
+    } catch {}
+    if (res.status === 401) die("the Worker refused boa's key. If boa was set up again elsewhere, restore the newest backup here; `boa doctor` says more.");
+    die(`${method} ${pathname} failed (${res.status}): ${String(detail).slice(0, 300)}`);
+  }
+
+  async app(slug) {
+    return (await this.call("GET", `/apps/${slug}`, { missingOk: true })) || die(`there is no app called "${slug}" (\`boa ls\` lists them)`);
+  }
+}
+
+const q = (s) => s.split("/").map(encodeURIComponent).join("/");
+
+// --- commands -----------------------------------------------------------------------------------
+
+function closingDate(days) {
+  const d = new Date(Date.now() + days * 864e5);
+  return `${d.toISOString().slice(0, 10)}T23:59:59Z`;
+}
+
+async function cmdNew(c, a) {
+  const slug = a._[0];
+  if (RESERVED.has(slug)) die(`"${slug}" is a name boa keeps for itself: pick another`);
+  if (await c.call("GET", `/apps/${slug}`, { missingOk: true })) die(`${slug} already exists: \`boa push\` updates it, \`boa password\` changes its password`);
+  if (!a.title) die("give the app a title: --title \"Dinner dates\"");
+  const password = a.password || passphrase();
+  const expires = a.days ? closingDate(Number(a.days)) : null;
+  const r = await c.call("PUT", `/apps/${slug}`, { json: { title: a.title, password, expires_at: expires, open: Boolean(a.open), private: Boolean(a.private) } });
+  savePassword(c.base, slug, password);
+  const access = a.open ? "open: no password, anyone with the address can use it" : `password: ${password}`;
+  const answers = a.private ? "private: each visitor sees only their own" : "shared: everyone sees everyone's";
+  console.log(`Created ${c.base}/${slug}/\n  title:    ${r.title}\n  access:   ${access}\n  answers:  ${answers}\n  closes:   ${expires ? `${expires.slice(0, 10)} (read-only after)` : "when you close it"}`);
+  console.log(`\nNext: \`boa push ${slug}\`, check it with \`boa link ${slug}\`, then share ${a.open ? "the address" : "the address and password"}.`);
+}
+
+// Tailwind runs through npx at a pinned version. Its stylesheet can't be found by name from an
+// app's folder, so find where npx keeps it and import it by its full path.
+function tailwind() {
+  const r = spawnSync("npx", ["-y", "-p", TAILWIND, "-c", "command -v tailwindcss"], { encoding: "utf8" });
+  const bin = (r.stdout || "").trim().split("\n").pop();
+  if (r.status !== 0 || !bin || !fs.existsSync(bin)) die(`couldn't get the tool that builds page styles (needs the internet the first time):\n${(r.stderr || "").trim().slice(-400)}`);
+  const sheet = path.join(path.dirname(path.dirname(bin)), "tailwindcss", "index.css");
+  if (!fs.existsSync(sheet)) die("the page-style tool is missing a file: try again, or run `boa doctor`");
+  return { bin, sheet };
+}
+
+function buildCss(dir) {
+  const { bin, sheet } = tailwind();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "boa-css-"));
+  try {
+    // source(none): Tailwind would otherwise scan the whole working folder, not just this app.
+    let input = `@import ${JSON.stringify(sheet)} source(none);\n@source ${JSON.stringify(dir)};\n`;
+    const custom = path.join(dir, "input.css");
+    if (fs.existsSync(custom)) input += fs.readFileSync(custom, "utf8").replace(/@import\s+["']tailwindcss["'][^;]*;/g, "").replace(/@source\s+["']\.\/?["']\s*;/g, "");
+    const src = path.join(tmp, "input.css");
+    fs.writeFileSync(src, input);
+    const r = spawnSync(bin, ["-i", src, "-o", path.join(dir, "app.css"), "--minify"], { encoding: "utf8" });
+    if (r.status !== 0) die(`building the page's styles failed:\n${(r.stderr || "").trim().slice(-800)}`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  console.log(`  built app.css (${(fs.statSync(path.join(dir, "app.css")).size / 1024).toFixed(1)} KB)`);
+}
+
+function walk(dir, rel = "") {
+  const out = [];
+  for (const name of fs.readdirSync(path.join(dir, rel)).sort()) {
+    if (name.startsWith(".") || name.startsWith("_") || SKIP_FILES.has(name)) continue;
+    const r = rel ? `${rel}/${name}` : name;
+    const st = fs.statSync(path.join(dir, r));
+    if (st.isDirectory()) {
+      if (!SKIP_DIRS.has(name)) out.push(...walk(dir, r));
+    } else if (st.isFile()) out.push(r);
+  }
+  return out;
+}
+
+function contentType(file) {
+  const t = TYPES[path.extname(file).toLowerCase()] || "application/octet-stream";
+  return TEXT_TYPES.test(t) ? `${t}; charset=utf-8` : t;
+}
+
+function appFolder(slug, given) {
+  const dir = path.resolve(given ? given.replace(/^~(?=\/|$)/, os.homedir()) : path.join(appsDir(), slug));
+  if (!fs.existsSync(path.join(dir, "index.html"))) die(`${dir} has no index.html`);
+  return dir;
+}
+
+async function cmdPush(c, a) {
+  const slug = a._[0];
+  const dir = appFolder(slug, a._[1]);
+  await c.app(slug);
+  console.log(`Publishing ${dir} to ${slug}`);
+  const htmls = walk(dir).filter((f) => f.endsWith(".html")).map((f) => fs.readFileSync(path.join(dir, f), "utf8"));
+  if (!a["no-css"] && htmls.some((h) => h.includes("app.css"))) buildCss(dir);
+  // Pages should load nothing from other websites: Alpine.js and the fonts come from boa itself.
+  const outside = new Set();
+  for (const h of htmls) for (const m of h.matchAll(/<(?:script|link)\b[^>]*?\b(?:src|href)=["'](https?:\/\/[^"'/]+)/gi)) outside.add(m[1]);
+  if (outside.size) console.log(`  warning: the page loads files from ${[...outside].join(", ")}. Use /_boa/alpine.js and /_boa/fonts.css instead, so it depends on nobody else.`);
+
+  const files = walk(dir);
+  const remote = Object.fromEntries((await c.call("GET", `/apps/${slug}/files`)).map((f) => [f.path, f.etag]));
+  let uploaded = 0;
+  for (const rel of files) {
+    const body = fs.readFileSync(path.join(dir, rel));
+    const md5 = crypto.createHash("md5").update(body).digest("hex");
+    if (remote[rel] === md5) continue;
+    if (body.length > MAX_FILE_BYTES) die(`${rel} is ${(body.length / 1e6).toFixed(0)} MB: the most boa can hold in one file is 25 MB`);
+    const parts = Math.max(1, Math.ceil(body.length / PIECE_BYTES));
+    const upload = crypto.randomUUID();
+    for (let i = 0; i < parts; i++) {
+      await c.call("PUT", `/apps/${slug}/files/${q(rel)}`, {
+        data: body.subarray(i * PIECE_BYTES, (i + 1) * PIECE_BYTES),
+        headers: { "Content-Type": contentType(rel), "X-Boa-Etag": md5, "X-Boa-Upload": upload, "X-Boa-Part": String(i), "X-Boa-Parts": String(parts) },
+      });
+    }
+    uploaded++;
+    console.log(`  up   ${rel} (${(body.length / 1024).toFixed(0)} KB)`);
+    if (/\.(png|jpe?g)$/i.test(rel) && body.length > IMAGE_WARN_BYTES) {
+      console.log(`       warning: a ${(body.length / 1e6).toFixed(1)} MB image is slow on a phone. \`sips -Z 1600 "${path.join(dir, rel)}"\` shrinks it to 1600 pixels.`);
+    }
+  }
+  let removed = 0;
+  for (const rel of Object.keys(remote).filter((r) => !files.includes(r)).sort()) {
+    await c.call("DELETE", `/apps/${slug}/files/${q(rel)}`);
+    removed++;
+    console.log(`  del  ${rel}`);
+  }
+  console.log(`Done: ${uploaded} uploaded, ${removed} removed, ${files.length - uploaded} unchanged.\n${c.base}/${slug}/`);
+}
+
+function fmtValue(v) {
+  if (typeof v === "string") return !v.includes("\n") && v.length <= 100 ? JSON.stringify(v) : "\n" + v.replace(/^/gm, "      ");
+  if (Array.isArray(v) && v.every((x) => typeof x === "string")) return `[${v.join(", ")}]`;
+  return JSON.stringify(v);
+}
+
+const groupBy = (rows, key) => rows.reduce((g, r) => ((g[r[key]] ||= []).push(r), g), {});
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function statusLine(i) {
+  return i.closed ? "closed" : i.expires_at ? `open until ${i.expires_at.slice(0, 10)}` : "open";
+}
+
+async function cmdData(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  const x = await c.call("GET", `/apps/${slug}/export`);
+  if (a.json) return console.log(JSON.stringify(x, null, 2));
+  const i = x.info;
+  console.log(`${i.title} — ${c.base}/${slug}/ (${statusLine(i)})`);
+  const priv = x.private_state || [];
+  const visits = Object.fromEntries((x.visits || []).map((v) => [v.visitor, v]));
+  if (i.private) {
+    console.log(`Private answers: ${plural(Object.keys(visits).length, "visitor")}, ${i.visitors} with answers, ${plural(i.answers, "answer")}, last ${when(i.last_at)}, ${plural(x.history.length, "change")} in history\n`);
+  } else {
+    console.log(`${plural(i.answers, "answer")}, last ${when(i.last_at)}, ${plural(x.history.length, "change")} in history\n`);
+  }
+  if (x.state.length && priv.length) console.log("Shared answers:");
+  for (const r of x.state) console.log(`  ${r.key}: ${fmtValue(r.value)}\n      — ${r.author}, ${when(r.at)}`);
+  const groups = groupBy(priv, "visitor");
+  // Everyone who has opened the page, then anyone with answers but no recorded visit (admin writes).
+  for (const v of [...Object.keys(visits), ...Object.keys(groups).filter((g) => !visits[g])]) {
+    const rows = groups[v] || [];
+    const latest = rows.reduce((m, r) => (!m || r.at > m.at ? r : m), null);
+    const vi = visits[v];
+    const name = vi?.name || latest?.author || "(no name yet)";
+    const bits = [name, `visitor ${v.slice(0, 8)}`];
+    if (vi) bits.push(vi.device || "?", `${plural(vi.visits, "visit")}, first ${when(vi.first_at)}, last ${when(vi.last_at)}`);
+    bits.push(plural(rows.length, "answer") + (latest ? `, last ${when(latest.at)}` : ""));
+    console.log("\n" + bits.join(" · "));
+    for (const r of rows) console.log(`  ${r.key}: ${fmtValue(r.value)}${r.author !== name ? ` — ${r.author}` : ""}`);
+  }
+  if (a.history) {
+    console.log("\nHistory (oldest first):");
+    for (const h of x.history) console.log(`  ${when(h.at)}  ${h.visitor ? `${h.author} [${h.visitor.slice(0, 8)}]` : h.author}: ${h.key} = ${fmtValue(h.value)}`);
+  }
+}
+
+async function resolveVisitor(c, slug, prefix) {
+  const x = await c.call("GET", `/apps/${slug}/export`);
+  const ids = new Set([...(x.private_state || []).map((r) => r.visitor), ...(x.visits || []).map((v) => v.visitor)]);
+  const hits = [...ids].filter((v) => v.startsWith(String(prefix).toLowerCase())).sort();
+  if (!hits.length) die(`no visitor on ${slug} starts with "${prefix}" (\`boa data ${slug}\` lists them)`);
+  if (hits.length > 1) die(`"${prefix}" matches ${hits.length} visitors: give more of the id`);
+  return hits[0];
+}
+
+function table(head, rows) {
+  const widths = head.map((_, i) => Math.max(...[head, ...rows].map((r) => String(r[i]).length)));
+  for (const r of [head, ...rows]) console.log(r.map((s, i) => String(s).padEnd(widths[i])).join("  ").trimEnd());
+}
+
+async function cmdLs(c) {
+  const apps = await c.call("GET", "/apps");
+  if (!apps.length) return console.log("No apps yet.");
+  table(["APP", "TITLE", "ANSWERS", "LAST ANSWER", "CLOSES"],
+    apps.map((x) => [x.slug, (x.title || "").slice(0, 34), x.answers, when(x.last_at), x.closed ? "closed" : (x.expires_at || "").slice(0, 10) || "—"]));
+  console.log(`\n${c.base}/<app>/`);
+}
+
+async function cmdInfo(c, a) {
+  const slug = a._[0];
+  const x = await c.app(slug);
+  let pw = readJson(PASSWORDS, {})[`${c.base}/${slug}`] || `(not recorded on this computer: \`boa password ${slug}\` sets a new one)`;
+  if (x.open) pw = `none needed (open; \`boa password ${slug}\` puts one back)`;
+  console.log(`${x.title}\n  address:  ${c.base}/${slug}/\n  password: ${pw}\n  answers:  ${x.answers} (last ${when(x.last_at)})` +
+    `\n  closes:   ${x.closed ? "closed now" : (x.expires_at || "").slice(0, 10) || "when you close it"}`);
+  console.log(x.private
+    ? `  private:  each visitor sees only their own answers (${plural(x.visited || 0, "visitor")} so far, ${x.visitors || 0} with answers)`
+    : "  shared:   everyone who can open it sees every answer");
+  const files = await c.call("GET", `/apps/${slug}/files`);
+  console.log(`  files:    ${files.length} (${(files.reduce((n, f) => n + f.size, 0) / 1024).toFixed(0)} KB)`);
+}
+
+async function cmdPassword(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  const password = a.password || passphrase();
+  await c.call("PUT", `/apps/${slug}`, { json: { password, open: false } });
+  savePassword(c.base, slug, password);
+  console.log(`New password for ${slug}: ${password}\nEveryone signed in to it has been signed out, and it needs the password again.`);
+}
+
+async function cmdPrivate(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  await c.call("PUT", `/apps/${slug}`, { json: { private: !a.off } });
+  console.log(a.off
+    ? `${slug} is shared again: everyone sees the shared answers. Visitors' private answers are kept but hidden.`
+    : `${slug} is private: each visitor (each browser) sees only their own answers. Any shared answers are kept but hidden from visitors.\n\`boa data ${slug}\` shows everyone's.`);
+}
+
+async function cmdOpen(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  await c.call("PUT", `/apps/${slug}`, { json: { open: true } });
+  console.log(`${slug} is open: no password, anyone with ${c.base}/${slug}/ can read and answer.\n\`boa password ${slug}\` puts a password back.`);
+}
+
+async function cmdClose(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  await c.call("PUT", `/apps/${slug}`, { json: { closed: true } });
+  console.log(`${slug} is closed: people can still read it, but answers are locked. \`boa reopen ${slug}\` undoes it.`);
+}
+
+async function cmdReopen(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  const expires = a.days ? closingDate(Number(a.days)) : null;
+  await c.call("PUT", `/apps/${slug}`, { json: { closed: false, expires_at: expires } });
+  console.log(`${slug} is open again${expires ? ` until ${expires.slice(0, 10)}` : ""}.`);
+}
+
+function ask(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (answer) => (rl.close(), resolve(answer.trim()))));
+}
+
+async function confirm(slug, what, yes) {
+  if (yes) return;
+  if (!process.stdin.isTTY) die(`to ${what} ${slug}, add --yes (only when its owner has asked for that)`);
+  if ((await ask(`Type the app's name to ${what} it: `)) !== slug) die("cancelled");
+}
+
+async function exportToFile(c, slug) {
+  const x = await c.call("GET", `/apps/${slug}/export`);
+  const stamp = stampNow();
+  const out = path.join(exportsDir(), `${slug}-${stamp}.json`);
+  fs.mkdirSync(exportsDir(), { recursive: true });
+  fs.writeFileSync(out, JSON.stringify(x, null, 2) + "\n");
+  return out;
+}
+
+async function cmdExport(c, a) {
+  await c.app(a._[0]);
+  console.log(await exportToFile(c, a._[0]));
+}
+
+async function cmdReset(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  await confirm(slug, "clear every answer in", a.yes);
+  const out = await exportToFile(c, slug);
+  await c.call("DELETE", `/apps/${slug}/state`);
+  console.log(`Cleared the answers and history in ${slug} (saved first to ${out}).`);
+}
+
+async function cmdRm(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  await confirm(slug, "permanently delete", a.yes);
+  const out = await exportToFile(c, slug);
+  const r = await c.call("DELETE", `/apps/${slug}`);
+  savePassword(c.base, slug, null);
+  console.log(`Deleted ${slug} from the internet (${plural(r.files_deleted, "file")}). Its answers were saved first to ${out}`);
+}
+
+async function cmdLink(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  const body = { minutes: Number(a.minutes) || 30 };
+  if (a.as) body.name = a.as;
+  if (a.visitor) body.visitor = await resolveVisitor(c, slug, a.visitor);
+  const r = await c.call("POST", `/apps/${slug}/links`, { json: body });
+  const u = new URL(r.url);
+  console.log(`${c.base}${u.pathname}${u.search}`);
+  console.error(`(works once, until ${when(r.expires_at)})`);
+}
+
+async function cmdSet(c, a) {
+  const [slug, key, raw] = a._;
+  if (raw === undefined) die("usage: boa set <app> <key> <value>");
+  let value = raw;
+  try {
+    value = JSON.parse(raw);
+  } catch {}
+  const body = { value, author: a.as || "Owner" };
+  if (a.visitor) body.visitor = await resolveVisitor(c, slug, a.visitor);
+  const r = await c.call("PUT", `/apps/${slug}/state/${q(key)}`, { json: body });
+  console.log(`${r.key} = ${fmtValue(r.value)} (as ${r.author})`);
+}
+
+async function cmdMerge(c, a) {
+  const [slug, from, into] = a._;
+  if (!into) die("usage: boa merge <app> <from> <into>");
+  const f = await resolveVisitor(c, slug, from);
+  const t = await resolveVisitor(c, slug, into);
+  const r = await c.call("POST", `/apps/${slug}/visitors/merge`, { json: { from: f, into: t } });
+  console.log(`Merged visitor ${f.slice(0, 8)} into ${r.into.slice(0, 8)}: ${plural(r.answers, "answer")}. Both browsers now see the same answers.`);
+}
+
+// --- running the Worker -------------------------------------------------------------------------
+
+function wrangler(args, opts = {}) {
+  const cfg = loadConfig();
+  const env = { ...process.env, WRANGLER_SEND_METRICS: "false" };
+  if (cfg.account_id && !env.CLOUDFLARE_ACCOUNT_ID) env.CLOUDFLARE_ACCOUNT_ID = cfg.account_id;
+  return spawnSync("npx", ["-y", WRANGLER, ...args], { cwd: WORKER, env, stdio: "inherit", ...opts });
+}
+
+// The local Worker's own keys: made up on first use, only ever valid on this computer.
+function ensureDevVars() {
+  const file = path.join(WORKER, ".dev.vars");
+  if (readEnvFile(file).ADMIN_TOKEN) return;
+  fs.writeFileSync(file, `ADMIN_TOKEN=${crypto.randomBytes(24).toString("hex")}\nSESSION_SECRET=${crypto.randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
+}
+
+function cmdDev() {
+  ensureDevVars();
+  console.log(`Starting a practice copy of boa on this computer at ${LOCAL_BASE} (Ctrl-C stops it). Use it with --local.`);
+  process.exitCode = wrangler(["dev", "--port", String(LOCAL_PORT), "--ip", "127.0.0.1"]).status ?? 1;
+}
+
+function cmdDeploy() {
+  const cfg = loadConfig();
+  const args = ["deploy"];
+  if (cfg.domain) args.push("--domains", cfg.domain);
+  process.exitCode = wrangler(args).status ?? 1;
+}
+
+// --- the command line ---------------------------------------------------------------------------
+
+// name: [usage, one-line help, function, {flags that take a value}, {flags that don't}, needs a Worker?]
+const COMMANDS = {
+  new: ["<app> --title T [--open] [--private] [--days N] [--password P]", "create an app (a password is made up unless it's open)", cmdNew, ["title", "password", "days"], ["open", "private"], true],
+  push: ["<app> [folder] [--no-css]", "build the page's styles and publish the folder's files", cmdPush, [], ["no-css"], true],
+  link: ["<app> [--as NAME] [--minutes M] [--visitor ID]", "a one-time sign-in link, for previews or instead of a password", cmdLink, ["as", "minutes", "visitor"], [], true],
+  data: ["<app> [--history] [--json]", "show the answers: who, what, when", cmdData, [], ["history", "json"], true],
+  ls: ["", "list the apps", cmdLs, [], [], true],
+  info: ["<app>", "an app's address, password and status", cmdInfo, [], [], true],
+  set: ["<app> <key> <value> [--as NAME] [--visitor ID]", "write an answer as the owner (works when closed)", cmdSet, ["as", "visitor"], [], true],
+  merge: ["<app> <from> <into>", "private apps: one person on two browsers becomes one visitor", cmdMerge, [], [], true],
+  private: ["<app> [--off]", "give each visitor their own answers, seen only by them and you", cmdPrivate, [], ["off"], true],
+  open: ["<app>", "drop the password: anyone with the address can read and answer", cmdOpen, [], [], true],
+  password: ["<app> [--password P]", "set a new password (signs everyone out; ends open access)", cmdPassword, ["password"], [], true],
+  close: ["<app>", "make an app read-only", cmdClose, [], [], true],
+  reopen: ["<app> [--days N]", "make a closed app writable again", cmdReopen, ["days"], [], true],
+  export: ["<app>", "save the answers and history to a file in boa-exports", cmdExport, [], [], true],
+  reset: ["<app> [--yes]", "clear all answers and history (saves a copy first)", cmdReset, [], ["yes"], true],
+  rm: ["<app> [--yes]", "delete an app for good (saves its answers first)", cmdRm, [], ["yes"], true],
+  dev: ["", `run a practice copy of boa on this computer (port ${LOCAL_PORT}); use it with --local`, cmdDev, [], [], false],
+  deploy: ["", "put the Worker on the internet again (after changing it)", cmdDeploy, [], [], false],
+};
+
+function usage() {
+  const rows = Object.entries(COMMANDS).map(([name, [args, help]]) => [`  boa ${name} ${args}`.trimEnd(), help]);
+  const w = Math.min(46, Math.max(...rows.map((r) => r[0].length)));
+  return `boa ${VERSION}: small web apps on your own Cloudflare account.\n\n` +
+    rows.map(([l, h]) => (l.length > w ? `${l}\n${" ".repeat(w + 2)}${h}` : `${l.padEnd(w + 2)}${h}`)).join("\n") +
+    `\n\nAdd --local to any command to use the practice copy started by \`boa dev\`.`;
+}
+
+function parseArgs(argv, values, bools) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg.startsWith("--") || arg === "--") {
+      out._.push(arg);
+      continue;
+    }
+    const [name, inline] = arg.slice(2).split(/=(.*)/s);
+    if (bools.includes(name)) out[name] = true;
+    else if (values.includes(name)) {
+      const v = inline !== undefined ? inline : argv[++i];
+      if (v === undefined) die(`--${name} needs a value`);
+      out[name] = v;
+    } else die(`unknown option --${name}`);
+  }
+  return out;
+}
+
+async function main(argv) {
+  const local = argv.includes("--local");
+  argv = argv.filter((x) => x !== "--local");
+  const name = argv[0];
+  if (!name || name === "help" || name === "--help" || name === "-h") return console.log(usage());
+  if (name === "--version" || name === "version") return console.log(VERSION);
+  const cmd = COMMANDS[name];
+  if (!cmd) die(`there is no "${name}" command. Run \`boa help\` for the list.`);
+  const [args, help, fn, values, bools, needsWorker] = cmd;
+  if (argv.includes("--help")) return console.log(`boa ${name} ${args}\n  ${help}`);
+  const a = parseArgs(argv.slice(1), values, bools);
+  a.local = local;
+  if (args.startsWith("<app>")) {
+    if (!a._[0]) die(`usage: boa ${name} ${args}`);
+    if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(a._[0])) die(`"${a._[0]}" can't be an app's name: use lowercase letters, digits and hyphens (2 to 41 characters)`);
+  }
+  await fn(needsWorker ? new Client(local) : null, a);
+}
+
+module.exports = { request, pinned, readEnvFile, loadConfig, REPO, WORKER, LOCAL_BASE, VERSION };
+
+if (require.main === module) {
+  main(process.argv.slice(2)).catch((e) => {
+    if (!(e instanceof Stop)) throw e;
+    console.error(`boa: ${e.message}`);
+    process.exitCode = 1;
+  });
+}
