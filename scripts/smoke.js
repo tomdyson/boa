@@ -75,9 +75,14 @@ class Socket {
     this.socket = socket;
     this.buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
     this.waiting = null;
+    this.ended = !socket; // true once the server has closed the connection
     if (socket) {
       socket.on("data", (d) => {
         this.buf = Buffer.concat([this.buf, d]);
+        this.waiting?.();
+      });
+      socket.on("close", () => {
+        this.ended = true;
         this.waiting?.();
       });
       socket.on("error", () => {});
@@ -90,10 +95,13 @@ class Socket {
     for (;;) {
       const frame = this.#frame();
       if (frame && frame.op === 1) return frame.data.toString("utf8");
-      if (frame && frame.op === 8) return null;
+      if (frame && frame.op === 8) {
+        this.ended = true;
+        return null;
+      }
       if (frame) continue;
       const left = deadline - Date.now();
-      if (left <= 0 || !this.socket) return null;
+      if (left <= 0 || this.ended) return null;
       await new Promise((r) => {
         const t = setTimeout(r, left);
         this.waiting = () => (clearTimeout(t), r());
@@ -184,6 +192,7 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     check("upload to a reserved _name -> refused", (await put(s1, "_boa.js", Buffer.from("x"))).status === 400);
     check("upload with .. -> refused", [400, 404].includes((await put(s1, "a/..%2F..%2Fx", Buffer.from("x"))).status));
     check("one piece over 1 MB -> refused", (await put(s1, "toobig.bin", Buffer.alloc(1024 * 1024 + 1))).status === 413);
+    check("a file of more than 25 pieces -> refused", (await put(s1, "huge.bin", Buffer.from("x"), { "X-Boa-Upload": "check-upload-0", "X-Boa-Part": "0", "X-Boa-Parts": "26" })).status === 413);
     // A 2.5 MB file goes up in three pieces and must come back identical (checked after sign-in).
     const big = crypto.randomBytes(2_500_000);
     const md5 = crypto.createHash("md5").update(big).digest("hex");
@@ -213,6 +222,9 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     check("so do the fonts", r.status === 200 && r.text.includes("/_boa/inter.woff2") && font.status === 200 && font.headers["content-type"] === "font/woff2", font.status);
     r = await site.req("POST", `/${s1}/_login`, { form: { password: "wrong" } });
     check("wrong password -> refused", r.status === 401, r.status);
+    const elsewhere = { Origin: "https://elsewhere.example" };
+    r = await site.req("POST", `/${s1}/_login`, { form: { password: pw }, headers: elsewhere });
+    check("the password form posted from another website -> refused", r.status === 403 && !cookieFrom(r), r.status);
     r = await site.req("POST", `/${s1}/_login`, { form: { password: pw } });
     let raw = cookieFrom(r);
     check("right password -> signed in", r.status === 303 && Boolean(raw), r.status);
@@ -249,6 +261,9 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     check("bad key -> refused", (await save("has space", { value: 1 })).status === 400);
     check("missing value -> refused", (await save("A1.x", { nope: 1 })).status === 400);
     check("oversized value -> refused", (await save("A1.big", { value: "x".repeat(70000) })).status === 400);
+    check("size is counted in bytes, not characters", (await save("A1.wide", { value: "é".repeat(40000) })).status === 400);
+    r = await save("A1.who", { value: 1 }, { "X-Boa-Author": "owner" });
+    check("a visitor can't sign an answer as the owner", r.json().author === "Owner (a visitor)", r.json().author);
     r = await site.req("GET", `/${s1}/_api/state`, { headers: cookie });
     check("read the answers back", r.status === 200 && r.json()[0]?.value === "a");
 
@@ -256,6 +271,7 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     let sock = await site.ws(`/${s1}/_api/live`);
     check("live connection without signing in -> refused", sock.status === 401, sock.status);
     sock.close();
+    check("live connection asked for by another website -> refused", (await site.ws(`/${s1}/_api/live`, cookie.Cookie, elsewhere)).status === 403);
     sock = await site.ws(`/${s1}/_api/live`, cookie.Cookie);
     check("live connection when signed in", sock.status === 101, sock.status);
     const t0 = Date.now();
@@ -269,6 +285,8 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     r = await site.req("GET", link);
     check("opening a link shows Continue and signs nobody in", r.status === 200 && r.text.includes("Continue") && !cookieFrom(r), r.status);
     check("opening it again (a message preview) doesn't use it up", (await site.req("GET", link)).status === 200);
+    r = await site.req("POST", new URL(link, site.base).pathname, { form: { t: new URL(link, site.base).searchParams.get("t") }, headers: elsewhere });
+    check("Continue pressed for you by another website -> refused, link not used", r.status === 403 && !cookieFrom(r) && (await site.req("GET", link)).status === 200, r.status);
     r = await pressContinue(link);
     check("Continue signs in", r.status === 303 && Boolean(cookieFrom(r)), r.status);
     check("the link carries the visitor's name", cookieFrom(r, "boa_name").startsWith("boa_name=Linked"));
@@ -448,6 +466,8 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
 
     r = await site.req("GET", new URL(annLink).pathname + new URL(annLink).search);
     check("opening the private link shows Continue and changes nothing", r.status === 200 && r.text.includes("Continue") && !cookieFrom(r, "boa_v"), r.status);
+    r = await site.req("POST", `/${s3}/_mine`, { form: { t: new URL(annLink).searchParams.get("t") }, headers: elsewhere });
+    check("another website can't hand a visitor someone else's booking", r.status === 403 && !cookieFrom(r, "boa_v"), r.status);
     r = await site.req("POST", `/${s3}/_mine`, { form: { t: new URL(annLink).searchParams.get("t") } });
     const annPhone = { Cookie: pair(cookieFrom(r, "boa_v")) };
     check("Continue opens that booking on another device", r.status === 303 && (await mine(annPhone)).bookings?.[0]?.name === "Ann Lee", r.status);
@@ -528,6 +548,9 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     await admin("DELETE", `/apps/${s3}/state`);
     x = await exported(s3);
     check("reset clears the bookings and keeps the limits", x.bookings.length === 0 && x.info.limits.yoga.left === 2 && x.info.limits.solo.left === 1, x.info.limits);
+    check("after a reset, old private links are dead", (await site.req("POST", `/${s3}/_mine`, { form: { t: new URL(annLink).searchParams.get("t") } })).status === 410);
+    r = await site.req("GET", `/${s3}/_api/bookings`, { headers: ann });
+    check("and old visitor cookies start afresh", r.status === 200 && Boolean(cookieFrom(r, "boa_v")));
 
     section("sign-ups: holding back floods");
     await admin("PUT", `/apps/${s4}`, { title: "Check flood", password: pw, open: true, limits: { hall: 30 } });
@@ -535,6 +558,8 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     for (let i = 0; i < 20; i++) if ((await book(await fresh(s4), "hall", { name: `Guest ${i}` }, s4)).status === 200) accepted++;
     r = await book(await fresh(s4), "hall", { name: "Guest 21" }, s4);
     check("one internet address can make 20 bookings a day on an app, not 21", accepted === 20 && r.status === 429 && (await places(s4)).hall.taken === 20, [accepted, r.status]);
+    await admin("PUT", `/apps/${s4}`, { bookings_per_address: 25 });
+    check("the owner can raise that number for one app", (await book(await fresh(s4), "hall", { name: "Guest 21" }, s4)).status === 200);
     const eager = await fresh(s4);
     const burst = await Promise.all(Array.from({ length: 70 }, (_, i) =>
       site.req("PUT", `/${s4}/_api/state/flood.${i}`, { body: { value: i }, headers: { ...eager, "X-Boa-Author": "Eager" } })));
@@ -542,8 +567,12 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     check("70 saves at once from one visitor: the first 60 land, the rest are told to slow down", slowed === 10 && burst.filter((res) => res.status === 200).length === 60, burst.map((res) => res.status).join(" ").slice(0, 80));
 
     section("changing the password");
+    const watching = await site.ws(`/${s1}/_api/live`, cookie.Cookie);
     await admin("PUT", `/apps/${s1}`, { password: `${pw}-new` });
     check("everyone signed in is signed out", (await site.req("GET", `/${s1}/_api/state`, { headers: cookie })).status === 401);
+    for (let i = 0; i < 5 && !watching.ended; i++) await watching.read(2000);
+    check("and pages that were open stop getting updates", watching.ended);
+    watching.close();
     check("a link made before the change is dead", (await site.req("GET", stale)).status === 410);
     r = await site.req("POST", `/${s1}/_login`, { form: { password: `${pw}-new` } });
     cookie = { Cookie: pair(cookieFrom(r)) };

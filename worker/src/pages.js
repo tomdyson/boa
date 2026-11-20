@@ -45,7 +45,11 @@ export function loginPage(slug, title, error) {
 }
 
 export const lockedPage = (title) =>
-  shell(title, `<h1>${esc(title)}</h1><p class="err">Too many wrong passwords. Please wait 15 minutes and try again.</p>`, 429);
+  shell(title, `<h1>${esc(title)}</h1><p class="err">Too many wrong passwords have been tried. Please try again in a while (it can take up to an hour), or ask whoever sent you this page for a link.</p>`, 429);
+
+// A form posted here from some other website: never something a visitor meant to do.
+export const elsewherePage = () =>
+  shell("Not from here", `<h1>That didn't come from this page</h1><p>Open the link you were sent and try again from there.</p>`, 403);
 
 // What opening a one-time link shows. The link is used only when the button is pressed, so a
 // message app or mail scanner that fetches the address to build a preview can't use it up.

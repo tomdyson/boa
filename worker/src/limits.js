@@ -13,6 +13,13 @@ export const LIMITS = {
   // Private apps: one set of answers per visitor, so the caps are per visitor plus a ceiling overall.
   maxKeysPerVisitor: 500,
   maxPrivateRows: 20000,
+  // Ceilings on the whole app, so nobody can fill the account's storage through one page: all its
+  // answers together, and its history (the oldest changes are dropped once it passes either figure).
+  maxStateBytes: 8 * 1024 * 1024,
+  maxHistoryBytes: 16 * 1024 * 1024,
+  maxHistoryRows: 50000,
+  maxBodyBytes: 256 * 1024,
+  maxSockets: 1000,
   // Files live in the app's Durable Object, cut into pieces. A SQLite row there can hold a few MB;
   // 1 MB pieces stay well inside that, and inside the free plan's processor time per request.
   pieceBytes: 1024 * 1024,

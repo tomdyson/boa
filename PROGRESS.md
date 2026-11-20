@@ -23,7 +23,25 @@ A short log so a new conversation can pick up. Written 20 November 2026.
   65 minutes for steps 1 to 6; step ids are new (`accounts`, `claude-app`, `claude-code`, `cloudflare`, `install`,
   `first-app`, `looking-after`, `own-domain`). Checked locally at desktop width and 375 px. **Not published.**
 
-Tests: `node scripts/smoke.js --local` (166 checks) and `node scripts/test-setup.js` (28 checks), both against `boa dev`.
+Tests: `node scripts/smoke.js --local` (179 checks) and `node scripts/test-setup.js` (28 checks), both against `boa dev`.
+
+- **Independent review (20 Nov).** A second, unbriefed read of the Worker and the command found no way in without the
+  key and no script injection, and these, all fixed and tested: history had no ceiling (now the newest 50,000 changes
+  or 16 MB, and 8 MB of answers per app); `reset` and `rm` couldn't run if the copy-first failed (`--no-copy`); forms
+  posted from other websites could hand a visitor someone else's identity (refused now, by `Origin`); live connections
+  outlived a password change; owner sign-ins and visitor links outlived deleting and recreating an app (each app now
+  has a random id, renewed on reset); `setup --local` could overwrite a real setup's keys (it refuses now); counts per
+  address treat an IPv6 /64 as one; smaller fixes to file size checks, the lockout wording and what `boa data` prints.
+
+## Known limits, by design
+
+- All apps share one web origin, so a script injected into one page could reach the others as that viewer. The defence
+  is the rule "never x-html visitors' text, load nothing from elsewhere". Separate origins per app would need a
+  wildcard domain, which workers.dev doesn't give.
+- A booking's private link is the visitor's identity for that app until it is reset or deleted. Anyone it is forwarded
+  to can change the booking.
+- 200 wrong passwords in an hour lock an app's sign-in for everyone (links from `boa link` still work).
+- `boa update` trusts whatever the highest `v*` tag on GitHub points at. Tags aren't signed.
 
 ## Waiting on Tom
 

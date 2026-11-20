@@ -6,7 +6,8 @@
 import { fingerprint, makeToken, readToken } from "./auth.js";
 import { FILE_RE, SESSION_DAYS, VISITOR_DAYS } from "./limits.js";
 import { owner } from "./owner.js";
-import { enterPage, linkExpiredPage, lockedPage, loginPage, notFoundPage, SEC_HEADERS } from "./pages.js";
+import { elsewherePage, enterPage, linkExpiredPage, lockedPage, loginPage, notFoundPage, SEC_HEADERS } from "./pages.js";
+import { LIMITS } from "./limits.js";
 import CLIENT_JS from "./boa.client.js";
 
 export const json = (data, status = 200) =>
@@ -29,6 +30,30 @@ function deviceLabel(ua = "") {
   const browser = /Edg\//.test(ua) ? "Edge" : /Firefox\/|FxiOS/.test(ua) ? "Firefox" : /Chrome\/|CriOS/.test(ua) ? "Chrome"
     : /Version\/.*Safari/.test(ua) ? "Safari" : /Claude\//.test(ua) ? "Claude app" : "";
   return [browser || "a browser", os && `on ${os}`].filter(Boolean).join(" ");
+}
+
+// A JSON body, or null if it isn't one or is bigger than anything boa accepts.
+export async function readJson(req) {
+  if (Number(req.headers.get("Content-Length") || 0) > LIMITS.maxBodyBytes || !req.body) return null;
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req.body) {
+    size += chunk.byteLength;
+    if (size > LIMITS.maxBodyBytes) return null;
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(await new Blob(chunks).text());
+  } catch {
+    return null;
+  }
+}
+
+// One internet connection's address. IPv6 gives each customer billions of addresses, so those are
+// counted by their first half (the /64), or the limits per address would mean nothing.
+export function addressOf(req) {
+  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  return ip.includes(":") ? ip.split(":").slice(0, 4).join(":") : ip;
 }
 
 function withCookie(res, cookie) {
@@ -60,7 +85,13 @@ export async function visit(store, env, req) {
   const sessionCookie = async () =>
     `boa=${await makeToken(secret, { k: "session", s: slug, f: fp, e: Date.now() + SESSION_DAYS * 864e5 })}; ${attrs}; HttpOnly; Max-Age=${SESSION_DAYS * 86400}`;
   const visitorCookie = async (v) =>
-    `boa_v=${await makeToken(secret, { k: "visitor", s: slug, v, e: Date.now() + VISITOR_DAYS * 864e5 })}; ${attrs}; HttpOnly; Max-Age=${VISITOR_DAYS * 86400}`;
+    `boa_v=${await makeToken(secret, { k: "visitor", s: slug, i: gate.aid, v, e: Date.now() + VISITOR_DAYS * 864e5 })}; ${attrs}; HttpOnly; Max-Age=${VISITOR_DAYS * 86400}`;
+  // Browsers say where a posted form came from. One from another website is somebody trying to sign
+  // this visitor in as someone else, or to use up their link.
+  const origin = req.headers.get("Origin");
+  const fromElsewhere = origin !== null && origin !== url.origin;
+
+  if (req.method === "POST" && fromElsewhere && ["_login", "_enter", "_mine", "_owner/enter"].includes(sub)) return elsewherePage();
 
   // The owner's page has its own sign-in, separate from visitors' and from the password.
   if (sub === "_owner" || sub.startsWith("_owner/")) return owner(store, env, req, { slug, sub: sub.slice("_owner".length + 1), url, title: gate.title, attrs });
@@ -69,7 +100,7 @@ export async function visit(store, env, req) {
   if (gate.open && sub === "_login") return redirect(`/${slug}/`);
 
   if (sub === "_login" && req.method === "POST") {
-    const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+    const ip = addressOf(req);
     const form = await req.formData().catch(() => null);
     const result = await store.checkLogin(ip, String(form?.get("password") || ""));
     if (result === "blocked") return lockedPage(gate.title);
@@ -105,7 +136,7 @@ export async function visit(store, env, req) {
     const posted = req.method === "POST";
     const t = posted ? String((await req.formData().catch(() => null))?.get("t") || "") : url.searchParams.get("t");
     const p = await readToken(secret, t, "mine");
-    if (!p || p.s !== slug) return linkExpiredPage();
+    if (!p || p.s !== slug || p.i !== gate.aid) return linkExpiredPage();
     if (!posted) return enterPage(`/${slug}/_mine`, gate.title, t, "This link opens your own booking on this device, so you can change or cancel it.");
     return redirect(`/${slug}/`, [await visitorCookie(p.v)]);
   }
@@ -119,7 +150,8 @@ export async function visit(store, env, req) {
   // which answers are theirs in a private app, and which bookings are theirs in any app.
   let newVisitorCookie = null;
   const p = await readToken(secret, getCookie(req, "boa_v"), "visitor");
-  let visitor = p && p.s === slug ? p.v : null;
+  let visitor = p && p.s === slug && p.i === gate.aid ? p.v : null;
+  if (sub === "_api/live" && fromElsewhere) return err("not from here", 403);
   if (!visitor) {
     if (sub === "_api/live") {
       if (gate.private) return err("no visitor", 401);
@@ -135,7 +167,7 @@ export async function visit(store, env, req) {
 // visitor: this browser. mine: the visitor whose answers these are, which is nobody in a shared app.
 async function serve(store, req, { slug, sub, visitor, isPrivate, origin }) {
   const mine = isPrivate ? visitor : null;
-  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  const ip = addressOf(req);
   const author = () => decode(req.headers.get("X-Boa-Author") || "");
   const visitorInfo = () => {
     const info = store.info();
@@ -165,8 +197,8 @@ async function serve(store, req, { slug, sub, visitor, isPrivate, origin }) {
   if (sub.startsWith("_api/state/") && req.method === "PUT") {
     if (store.tooFast(visitor, ip)) return err("too fast", 429);
     const key = sub.slice("_api/state/".length);
-    const body = await req.json().catch(() => null);
-    if (!body || !("value" in body)) return err("expected {value}", 400);
+    const body = await readJson(req);
+    if (!body || typeof body !== "object" || !("value" in body)) return err("expected {value}", 400);
     const result = store.setState(key, body.value, author() || "anonymous", false, mine);
     if (result.error) return err(result.error, result.error === "closed" ? 423 : 400);
     return json(result.row);
@@ -177,7 +209,7 @@ async function serve(store, req, { slug, sub, visitor, isPrivate, origin }) {
     if (req.method !== "POST" && req.method !== "DELETE") return err("method not allowed", 405);
     if (store.tooFast(visitor, ip)) return err("too fast", 429);
     const result = req.method === "POST"
-      ? store.book(visitor, ip, limit, (await req.json().catch(() => null)) || {})
+      ? store.book(visitor, ip, limit, (await readJson(req)) || {})
       : store.cancelBooking(visitor, limit);
     if (result.error) return err(result.error, result.status);
     return json({ ...result, ...(await myBookings()) });

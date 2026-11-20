@@ -45,7 +45,7 @@ One Cloudflare Worker, called `boa`, serves every app at `https://boa.<name>.wor
 | Piece | Holds |
 |---|---|
 | The Worker (`worker/src/index.js`) | the admin API the `boa` command uses, the files every page shares (`/_boa/`: Alpine.js and two fonts), and the hand-off of each visitor's request to the right app |
-| One Durable Object per app (`AppStore`, SQLite) | everything about that app: its files, settings and password hash, current answers, bookings and limits, a history of every change, wrong-password counts, used links, and the live connections to open pages |
+| One Durable Object per app (`AppStore`, SQLite) | everything about that app: its files, settings and password hash, current answers, bookings and limits, a history of changes (the most recent 50,000), wrong-password counts, used links, and the live connections to open pages |
 | One `Registry` Durable Object | the list of apps, and which one the bare address leads to |
 
 Each app's object answers its visitors itself (`worker/src/visit.js`), so a page request costs one Durable Object request. An address nobody has made an app at stores nothing.
@@ -56,16 +56,18 @@ Each app's object answers its visitors itself (`worker/src/visit.js`), so a page
 
 ### Who can see what
 
-- **Password apps:** one shared password per app, stored only as a slow hash (PBKDF2, 20,000 rounds: the free plan's processor allowance per request doesn't stretch to more). Signing in sets a signed cookie that works for that app only and lasts 30 days. Changing the password signs everyone out.
-- **Wrong passwords:** ten from one internet address in 15 minutes, or 200 on one app in an hour, lock sign-in for a while. Each wrong try also waits three quarters of a second.
+- **Password apps:** one shared password per app, stored only as a slow hash (PBKDF2, 20,000 rounds: the free plan's processor allowance per request doesn't stretch to more). Signing in sets a signed cookie that works for that app only and lasts 30 days. Changing the password signs everyone out and cuts off pages that were open.
+- **Wrong passwords:** ten from one internet address in 15 minutes, or 200 on one app in an hour, lock sign-in for a while (for everyone, in the second case). Each wrong try also waits three quarters of a second.
 - **Open apps** need no sign-in: anyone with the address can read and answer.
 - **Shared answers** are seen by everyone who can open the app. **Private answers** are seen only by the browser that gave them and by the owner; a signed cookie holding a random visitor id says whose are whose.
-- **Bookings** are always private: a visitor sees their own, and how many places are left. Places are counted inside the app's object, which does one thing at a time, so the last place can only be taken once. After booking, a visitor gets a private link that opens their booking on another device.
+- **Bookings** are always private: a visitor sees their own, and how many places are left. Places are counted inside the app's object, which does one thing at a time, so the last place can only be taken once. After booking, a visitor gets a private link that opens their booking on another device. In a private app it opens their answers too. It keeps working until the app is reset or deleted, so it is theirs to keep safe.
 - **One-time links** (`boa link`, `boa owner`) do nothing when opened: they show a Continue button, and pressing it is what uses the link. Message apps fetch links to make previews and would otherwise use them up.
 - **The owner page** (`<app>/_owner`) is reached only by a one-time link from `boa owner`. The device then stays signed in for a year. `boa owner --signout` signs every device out.
 - **The admin API** (`/_admin/…`) needs a long random key that only `~/.config/boa/` holds.
 - **Every page** tells search engines to keep out and refuses to be shown inside another website.
-- **Limits against filling it up:** answer names up to 200 characters, answers up to 64 KB, 5,000 answers per shared app (500 per visitor in a private one), 60 saves per visitor in ten seconds, 20 bookings a day per internet address per app, and a hidden field that only programs fill in.
+- **Forms posted from other websites** to the sign-in and link pages are refused, as are live connections opened from other websites, so no other site can sign a visitor in as someone else.
+- **Limits against filling it up:** answer names up to 200 characters, answers up to 64 KB each and 8 MB per app, 5,000 answers per shared app (500 per visitor in a private one), 60 saves per visitor in ten seconds and 300 from one internet address, 20 bookings a day per internet address per app (`boa settings <app> --bookings-a-day N` changes it), and a hidden field that only programs fill in. History keeps the most recent 50,000 changes or 16 MB.
+- **One address for everything.** All your apps share one web address. A page that ran a stranger's script could therefore reach your other apps, and your owner pages, as whoever was looking at it. That is why pages must never show visitors' words as HTML and must load nothing from other websites. `boa push` warns about the second; the first is a rule the skill gives Claude.
 - **Not checked:** names and email addresses. They are whatever people type.
 - **Nothing leaves:** the Worker sends no email and calls no other service, and pages load nothing from other websites.
 

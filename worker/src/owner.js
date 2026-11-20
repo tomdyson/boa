@@ -3,7 +3,7 @@
 // the device stays signed in for a year, until `boa owner --signout`.
 import { makeToken, readToken } from "./auth.js";
 import { BASE_CSS, enterPage, esc, linkExpiredPage, SEC_HEADERS } from "./pages.js";
-import { err, getCookie, json, redirect } from "./visit.js";
+import { err, getCookie, json, readJson, redirect } from "./visit.js";
 
 const OWNER_DAYS = 365;
 
@@ -45,15 +45,15 @@ export async function owner(store, env, req, { slug, sub, url, title }) {
 
   if (!sub && req.method === "GET") return ownerPage(slug, title);
   if (sub === "data" && req.method === "GET") {
-    const { history, merged, ...x } = store.exportAll();
-    return json({ slug, address: `${url.origin}/${slug}/`, changes: history.length, ...x });
+    const { history, merged, ...x } = store.exportAll(false);
+    return json({ slug, address: `${url.origin}/${slug}/`, changes: store.historyCount(), ...x });
   }
   if (sub === "bookings.csv" && req.method === "GET") {
-    const x = store.exportAll();
+    const x = store.exportAll(false);
     return download(`${slug}-bookings.csv`, csv([["what", "name", "email", "note", "booked at"], ...x.bookings.map((b) => [b.limit, b.name, b.email, b.note, b.at])]));
   }
   if (sub === "answers.csv" && req.method === "GET") {
-    const x = store.exportAll();
+    const x = store.exportAll(false);
     if (!x.info.private) return download(`${slug}-answers.csv`, csv([["question", "answer", "who", "when"], ...x.state.map((r) => [r.key, r.value, r.author, r.at])]));
     const names = Object.fromEntries(x.visits.map((v) => [v.visitor, v.name]));
     return download(`${slug}-answers.csv`, csv([["visitor", "name", "question", "answer", "when"], ...x.private_state.map((r) => [r.visitor.slice(0, 8), names[r.visitor] || r.author, r.key, r.value, r.at])]));
@@ -62,7 +62,7 @@ export async function owner(store, env, req, { slug, sub, url, title }) {
     // Changes must come from the owner page itself, not from a form on some other website.
     if (req.headers.get("Origin") !== url.origin) return err("this must come from the owner page", 403);
     if (sub === "unbook") {
-      const body = (await req.json().catch(() => null)) || {};
+      const body = (await readJson(req)) || {};
       const result = store.unbook(Number(body.id));
       return result.error ? err(result.error, 404) : json(result);
     }

@@ -136,7 +136,8 @@
         const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${base}/live`);
         ws.onopen = () => { delay = 1000; };
         ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch {} };
-        ws.onclose = () => setTimeout(connect, (delay = Math.min(delay * 2, 30000)));
+        // 4001: the password or the app's privacy has changed, so everyone comes back through the front door.
+        ws.onclose = (e) => (e.code === 4001 ? location.reload() : setTimeout(connect, (delay = Math.min(delay * 2, 30000))));
       };
       connect();
     },

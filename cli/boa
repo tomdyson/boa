@@ -291,7 +291,8 @@ function walk(dir, rel = "") {
   for (const name of fs.readdirSync(path.join(dir, rel)).sort()) {
     if (name.startsWith(".") || name.startsWith("_") || SKIP_FILES.has(name)) continue;
     const r = rel ? `${rel}/${name}` : name;
-    const st = fs.statSync(path.join(dir, r));
+    // lstat, not stat: a link in the folder is never followed, so it can't publish a file from elsewhere.
+    const st = fs.lstatSync(path.join(dir, r));
     if (st.isDirectory()) {
       if (!SKIP_DIRS.has(name)) out.push(...walk(dir, r));
     } else if (st.isFile()) out.push(r);
@@ -362,6 +363,15 @@ async function cmdPush(c, a) {
   console.log(`Done: ${uploaded} uploaded, ${removed} removed, ${files.length - uploaded} unchanged.\n${c.base}/${slug}/`);
 }
 
+// What visitors typed is about to be shown in a terminal: take out anything that could move the
+// cursor or change colours there. Line breaks and tabs stay.
+function printable(v) {
+  if (typeof v === "string") return v.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+  if (Array.isArray(v)) return v.map(printable);
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, val]) => [printable(k), printable(val)]));
+  return v;
+}
+
 function fmtValue(v) {
   if (typeof v === "string") return !v.includes("\n") && v.length <= 100 ? JSON.stringify(v) : "\n" + v.replace(/^/gm, "      ");
   if (Array.isArray(v) && v.every((x) => typeof x === "string")) return `[${v.join(", ")}]`;
@@ -378,8 +388,9 @@ function statusLine(i) {
 async function cmdData(c, a) {
   const slug = a._[0];
   await c.app(slug);
-  const x = await c.call("GET", `/apps/${slug}/export`);
+  let x = await c.call("GET", `/apps/${slug}/export`);
   if (a.json) return console.log(JSON.stringify(x, null, 2));
+  x = printable(x);
   if (a.csv) return console.log(a.answers || !Object.keys(x.info.limits || {}).length ? answersCsv(x) : bookingsCsv(x));
   const i = x.info;
   console.log(`${i.title} — ${c.base}/${slug}/ (${statusLine(i)})`);
@@ -470,6 +481,7 @@ async function cmdInfo(c, a) {
     ? `  private:  each visitor sees only their own answers (${plural(x.visited || 0, "visitor")} so far, ${x.visitors || 0} with answers)`
     : "  shared:   everyone who can open it sees every answer");
   for (const line of limitLines(x.limits)) console.log(`  places:   ${line}`);
+  if (Object.keys(x.limits || {}).length) console.log(`  bookings: at most ${x.bookings_per_address} a day from one internet address`);
   const files = await c.call("GET", `/apps/${slug}/files`);
   console.log(`  files:    ${files.length} (${(files.reduce((n, f) => n + f.size, 0) / 1024).toFixed(0)} KB)`);
 }
@@ -489,8 +501,12 @@ async function cmdSettings(c, a) {
   if (a["no-closing-date"]) body.expires_at = null;
   const limits = { ...parseLimits(a.limit), ...Object.fromEntries((a["remove-limit"] || []).map((n) => [n, null])) };
   if (Object.keys(limits).length) body.limits = limits;
+  if (a["bookings-a-day"]) {
+    body.bookings_per_address = Number(a["bookings-a-day"]);
+    if (!Number.isInteger(body.bookings_per_address) || body.bookings_per_address < 1) die("--bookings-a-day needs a whole number, for example 40");
+  }
   if (Object.keys(body).length) await c.call("PUT", `/apps/${slug}`, { json: body });
-  else console.log("Nothing changed. Options: --title, --private, --shared, --open, --limit name=places, --remove-limit name, --closes DATE, --no-closing-date.\n");
+  else console.log("Nothing changed. Options: --title, --private, --shared, --open, --limit name=places, --remove-limit name, --bookings-a-day N, --closes DATE, --no-closing-date.\n");
   await cmdInfo(c, a);
 }
 
@@ -574,13 +590,24 @@ async function confirm(slug, what, yes) {
   if ((await ask(`Type the app's name to ${what} it: `)) !== slug) die("cancelled");
 }
 
+// Saved copies hold people's names and answers, so only their owner can read them.
 async function exportToFile(c, slug) {
   const x = await c.call("GET", `/apps/${slug}/export`);
-  const stamp = stampNow();
-  const out = path.join(exportsDir(), `${slug}-${stamp}.json`);
+  const out = path.join(exportsDir(), `${slug}-${stampNow()}.json`);
   fs.mkdirSync(exportsDir(), { recursive: true });
-  fs.writeFileSync(out, JSON.stringify(x, null, 2) + "\n");
+  fs.writeFileSync(out, JSON.stringify(x, null, 2) + "\n", { mode: 0o600 });
   return out;
+}
+
+// reset and rm save a copy first. If the copy can't be made (an app stuffed too full to read back),
+// say so and offer the way through, rather than leaving an app that can't be cleared.
+async function copyFirst(c, slug, a, verb) {
+  if (a["no-copy"]) return null;
+  try {
+    return await exportToFile(c, slug);
+  } catch (e) {
+    die(`couldn't save a copy of ${slug}'s answers first (${e.message}).\nTo ${verb} it without a copy, add --no-copy.`);
+  }
 }
 
 async function cmdExport(c, a) {
@@ -592,19 +619,19 @@ async function cmdReset(c, a) {
   const slug = a._[0];
   await c.app(slug);
   await confirm(slug, "clear every answer in", a.yes);
-  const out = await exportToFile(c, slug);
+  const out = await copyFirst(c, slug, a, "clear");
   await c.call("DELETE", `/apps/${slug}/state`);
-  console.log(`Cleared the answers and history in ${slug} (saved first to ${out}).`);
+  console.log(`Cleared the answers, bookings and history in ${slug}${out ? ` (saved first to ${out})` : ""}.`);
 }
 
 async function cmdRm(c, a) {
   const slug = a._[0];
   await c.app(slug);
   await confirm(slug, "permanently delete", a.yes);
-  const out = await exportToFile(c, slug);
+  const out = await copyFirst(c, slug, a, "delete");
   const r = await c.call("DELETE", `/apps/${slug}`);
   savePassword(c, slug, null);
-  console.log(`Deleted ${slug} from the internet (${plural(r.files_deleted, "file")}). Its answers were saved first to ${out}`);
+  console.log(`Deleted ${slug} from the internet (${plural(r.files_deleted, "file")}).${out ? ` Its answers were saved first to ${out}` : ""}`);
 }
 
 async function cmdLink(c, a) {
@@ -833,11 +860,13 @@ async function cmdSetup(_c, a) {
   cfg.session_secret ||= crypto.randomBytes(32).toString("hex");
 
   if (a.local) {
+    // Only for trying setup out. It must never write over the keys of a real setup.
+    if (cfg.base_url && cfg.base_url !== LOCAL_BASE) die(`boa is already set up for real on this Mac (${cfg.base_url}). \`setup --local\` would replace its keys, so it won't run here. To use the practice copy, add --local to ordinary commands instead.`);
     ensureDevVars();
     cfg.base_url = LOCAL_BASE;
     cfg.admin_token = readEnvFile(path.join(WORKER, ".dev.vars")).ADMIN_TOKEN;
-    saveConfig(cfg);
     if (!(await waitForWorker(cfg.base_url, cfg.admin_token, 0.2))) die(`the practice copy isn't running: start it with \`boa dev\` in another window, then run \`boa setup --local\` again`);
+    saveConfig(cfg);
     say(`  Using the practice copy on this computer at ${LOCAL_BASE} (nothing is put on the internet)`);
   } else {
     say("  Checking the Cloudflare sign-in (the first time, this fetches Cloudflare's tool and can take a minute)…");
@@ -852,6 +881,7 @@ async function cmdSetup(_c, a) {
       die((a.account ? `the Cloudflare sign-in can't see an account "${a.account}".` : `the Cloudflare sign-in can see ${accounts.length} accounts, so say which one boa should use.`) +
         `\n${accounts.map((x) => `  ${x.id}  ${x.name}`).join("\n")}\n  Run: boa setup --account <id>`);
     }
+    if (cfg.base_url === LOCAL_BASE) die(`this Mac's boa settings belong to a practice copy. Remove ${home(CONFIG_DIR)} and run \`boa setup\` again.`);
     if (cfg.account_id && cfg.account_id !== account.id) die(`boa on this Mac is already set up on a different Cloudflare account (${cfg.account_id}). To move it, remove ${home(CONFIG_DIR)} first (after a \`boa backup\`).`);
     say(`  Cloudflare: signed in${me.email ? ` as ${me.email}` : ""}, account "${account.name}"`);
     cfg.account_id = account.id;
@@ -1098,9 +1128,13 @@ async function cmdBackup(c, a) {
       "This file holds the keys to your apps: anyone who has it can read every answer and change or delete every app. Keep it private.\n\n" +
       "settings/  the keys and each app's password\napps/      each app's page files\nanswers/   a copy of every app's answers and bookings on the day of the backup\n\n" +
       "To look after your apps from a new Mac: install boa (see its README), then run\n  boa setup --from <this zip file>\n");
-    const out = path.join(dest, `boa-backup-${stampNow()}.zip`);
-    const r = spawnSync("zip", ["-r", "-q", "-X", out, "boa-backup"], { cwd: tmp, encoding: "utf8" });
+    // Made inside the private temporary folder and only then moved, so it is never readable by others.
+    const made = path.join(tmp, "backup.zip");
+    const r = spawnSync("zip", ["-r", "-q", "-X", made, "boa-backup"], { cwd: tmp, encoding: "utf8" });
     if (r.status !== 0) die(`couldn't write the zip: ${(r.stderr || "").trim()}`);
+    fs.chmodSync(made, 0o600);
+    const out = path.join(dest, `boa-backup-${stampNow()}.zip`);
+    fs.copyFileSync(made, out, fs.constants.COPYFILE_EXCL);
     fs.chmodSync(out, 0o600);
     say(`Backed up ${plural(apps.length, "app")} (${plural(folders, "folder")} of page files, and everyone's answers) to\n  ${out}`);
     say("It holds the keys to your apps, so don't send it to anyone. To use it on a new Mac: boa setup --from <that file>");
@@ -1129,7 +1163,7 @@ async function cmdHome(c, a) {
 // name: [usage, one-line help, function, {flags that take a value}, {flags that don't}, needs a Worker?]
 const COMMANDS = {
   new: ["<app> --title T [--template checklist|questionnaire|signup] [--open] [--private] [--limit name=places]... [--days N] [--password P]", "create an app (a password is made up unless it's open)", cmdNew, ["title", "password", "days", "template"], ["open", "private"], true, ["limit"]],
-  settings: ["<app> [--title T] [--private|--shared] [--open] [--limit name=places]... [--remove-limit name]... [--closes DATE|--no-closing-date]", "show or change an app's settings", cmdSettings, ["title", "closes"], ["private", "shared", "open", "no-closing-date"], true, ["limit", "remove-limit"]],
+  settings: ["<app> [--title T] [--private|--shared] [--open] [--limit name=places]... [--remove-limit name]... [--bookings-a-day N] [--closes DATE|--no-closing-date]", "show or change an app's settings", cmdSettings, ["title", "closes", "bookings-a-day"], ["private", "shared", "open", "no-closing-date"], true, ["limit", "remove-limit"]],
   push: ["<app> [folder] [--no-css]", "build the page's styles and publish the folder's files", cmdPush, [], ["no-css"], true],
   link: ["<app> [--as NAME] [--minutes M] [--visitor ID]", "a one-time sign-in link, for previews or instead of a password", cmdLink, ["as", "minutes", "visitor"], [], true],
   data: ["<app> [--history] [--csv [--answers]] [--json]", "show the answers and bookings: who, what, when", cmdData, [], ["history", "json", "csv", "answers"], true],
@@ -1145,8 +1179,8 @@ const COMMANDS = {
   close: ["<app>", "make an app read-only", cmdClose, [], [], true],
   reopen: ["<app> [--days N]", "make a closed app writable again", cmdReopen, ["days"], [], true],
   export: ["<app>", "save the answers and history to a file in boa-exports", cmdExport, [], [], true],
-  reset: ["<app> [--yes]", "clear all answers and history (saves a copy first)", cmdReset, [], ["yes"], true],
-  rm: ["<app> [--yes]", "delete an app for good (saves its answers first)", cmdRm, [], ["yes"], true],
+  reset: ["<app> [--yes]", "clear all answers, bookings and history (saves a copy first)", cmdReset, [], ["yes", "no-copy"], true],
+  rm: ["<app> [--yes]", "delete an app for good (saves its answers first)", cmdRm, [], ["yes", "no-copy"], true],
   home: ["[app] [--none]", "choose the app that the bare address leads to", cmdHome, [], ["none"], true],
   setup: ["[--subdomain NAME] [--domain apps.example.com] [--account ID] [--apps-dir DIR] [--from backup.zip]", "set boa up on this Mac (safe to run again)", cmdSetup, ["subdomain", "domain", "account", "apps-dir", "from"], ["verbose", "force"], false],
   doctor: ["", "look for problems and say how to fix them", cmdDoctor, [], [], false],

@@ -77,7 +77,7 @@ Work these out from what the person says, then tell them in a sentence or two wh
 
 - **Text boxes use the draft helper:** `<textarea x-data="boaText('food.note')" x-model="draft" x-bind="field"></textarea>`. It saves a moment after typing stops, and someone else's live change can't overwrite what a person is typing. Never bind a text box straight to the store.
 - **Keys** look like `<section>.<field>` (`date.choice`, `travel.note`): letters, digits and `_ . : / -`. Answers are stored by key, so once a page is shared never rename a key or an option. Add new ones instead.
-- **Never put visitors' words into the page as HTML.** Show them with `x-text`. `x-html` is only for text you wrote yourself.
+- **Never put visitors' words into the page as HTML.** Show them with `x-text`. `x-html` is only for text you wrote yourself. All the person's apps share one web address, so one page that ran a visitor's script would expose every app.
 - **`:disabled` needs true or false.** Alpine treats "undefined" as disabled, so write `:disabled="Boolean(…)"`.
 - **Show the error:** keep the template's `x-show="$store.boa.error"` line, or problems are silent.
 - **Phones first.** One column, inputs at 16 px or larger (smaller makes iPhones zoom in), buttons a thumb can hit.
@@ -91,9 +91,9 @@ Work these out from what the person says, then tell them in a sentence or two wh
 
 - The `signup` template lists sessions. Each session's `id` is also the name of its limit, and the numbers of places are in `limits.json` beside the page (`{"tue-12-jan": 12}`), which `boa push` applies. `boa settings <app> --limit name=places` changes one directly.
 - Each visitor sees only their own booking and how many places are left, never who else has booked.
-- After booking, the page shows a private link. That link is how they change or cancel from another device, so the page should tell them to keep it.
+- After booking, the page shows a private link. That link is how they change or cancel from another device, so the page should tell them to keep it, and to keep it to themselves: whoever has it can change the booking. It stops working when the app is reset or deleted.
 - boa sends **no emails**: no confirmation to the person booking, no notice to the owner. Say so on the page, and tell the owner to look at their owner page or ask you.
-- One internet address can make 20 bookings a day on an app, and a hidden field (the template's `trap`) catches programs that fill in every box. Keep that field in the page.
+- One internet address can make 20 bookings a day on an app (`boa settings <app> --bookings-a-day 40` raises it, say for a class who all book from the same office), and a hidden field (the template's `trap`) catches programs that fill in every box. Keep that field in the page.
 - To remove someone's booking: `boa data <app>` shows each booking's number, then `boa unbook <app> <number>`. Nobody is told, so remind the owner to let them know.
 
 ## Reading the answers
@@ -117,7 +117,7 @@ Work these out from what the person says, then tell them in a sentence or two wh
 | `boa link <app> [--as NAME] [--visitor ID]` | one-time sign-in link, for previews or instead of a password |
 | `boa data <app> [--history] [--csv] [--json]` | read answers and bookings |
 | `boa ls` / `boa info <app>` | every app / one app's address, password and settings |
-| `boa settings <app> [--title T] [--private\|--shared] [--open] [--limit name=places] [--remove-limit name] [--closes DATE\|--no-closing-date]` | change settings |
+| `boa settings <app> [--title T] [--private\|--shared] [--open] [--limit name=places] [--remove-limit name] [--bookings-a-day N] [--closes DATE\|--no-closing-date]` | change settings |
 | `boa owner <app>` / `boa owner --signout` | one-time link to the owner page / sign every device out of every owner page |
 | `boa unbook <app> <number>` | remove a booking |
 | `boa set <app> <key> <value> [--as NAME] [--visitor ID]` | write an answer as the owner (works when closed) |
@@ -138,5 +138,6 @@ Work these out from what the person says, then tell them in a sentence or two wh
 - **"This page is having a rest":** Cloudflare's free plan allows about 100,000 requests a day across all the apps, and the count starts again at midnight UTC. A handful of friends won't get near it; a link shared very widely might.
 - **Ten wrong passwords** from one place lock that place out for 15 minutes. `boa link <app> --as NAME` gets someone in without the password.
 - **A new password signs everyone out.** Change one only if it has leaked.
+- **`boa reset` or `boa rm` says it couldn't save a copy first:** the app is too full to read back. Tell the owner, and if they agree to lose the answers, add `--no-copy`.
 - **Right after `boa deploy` or `boa update`,** old and new versions can both answer for a minute. If `boa check` fails then, wait a minute and run it again.
 - **Changing boa itself** (not an app) is not what this skill is for. The boa folder's README explains how it works.

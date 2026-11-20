@@ -12,6 +12,7 @@ const STALE_UPLOAD_MS = 60 * 60e3;
 // Saves and bookings: at most this many in each ten seconds.
 const RATE = { windowMs: 10e3, perVisitor: 60, perIp: 300 };
 
+const byteLength = (text) => new TextEncoder().encode(text).length;
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 export class AppStore extends DurableObject {
@@ -79,7 +80,7 @@ export class AppStore extends DurableObject {
   // `exists` is the only part the Worker asks for.
   gate() {
     const m = this.#meta();
-    return { exists: Boolean(m.pw_hash), pw_hash: m.pw_hash, title: m.title, closed: this.#isClosed(m), open: m.open === "1", private: m.private === "1" };
+    return { exists: Boolean(m.pw_hash), pw_hash: m.pw_hash, title: m.title, closed: this.#isClosed(m), open: m.open === "1", private: m.private === "1", aid: m.app_id };
   }
 
   exists() {
@@ -106,6 +107,7 @@ export class AppStore extends DurableObject {
       last_at: stats.last_at,
       limits: this.limitsInfo(),
       bookings: this.sql.exec("SELECT count(*) AS n FROM bookings").one().n,
+      bookings_per_address: Number(m.book_cap) || LIMITS.bookingsPerIpPerDay,
     };
   }
 
@@ -131,12 +133,21 @@ export class AppStore extends DurableObject {
         return { error: `"${name}" still has bookings: remove them first` };
       }
     }
+    const have = new Set(exists ? this.sql.exec("SELECT name FROM limits").toArray().map((r) => r.name) : []);
+    for (const [name, places] of limits) places === null ? have.delete(name) : have.add(name);
+    if (have.size > LIMITS.maxLimits) return { error: "too many limits in one app" };
+    if (body.bookings_per_address !== undefined) {
+      const n = body.bookings_per_address;
+      if (!(Number.isInteger(n) && n >= 1 && n <= 10000)) return { error: "bookings per address needs a whole number from 1 to 10000" };
+      patch.book_cap = n;
+    }
+    // Anyone connected before access was tightened must come back through the front door.
+    const tightened = exists && (Boolean(patch.pw_hash) || body.open === false || body.private !== undefined);
     if (!this.live) this.#schema();
     for (const [name, places] of limits) {
       if (places === null) this.sql.exec("DELETE FROM limits WHERE name = ?", name);
       else this.sql.exec("INSERT OR REPLACE INTO limits VALUES (?, ?)", name, places);
     }
-    if (this.sql.exec("SELECT count(*) AS n FROM limits").one().n > LIMITS.maxLimits) return { error: "too many limits in one app" };
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined) continue;
       if (v === null) this.sql.exec("DELETE FROM meta WHERE k = ?", k);
@@ -147,9 +158,55 @@ export class AppStore extends DurableObject {
       // Owner sign-ins carry this number. It starts somewhere random, so a sign-in to an app that was
       // deleted can't open a new app that is later given the same name.
       this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('owner_gen', ?)", String(crypto.getRandomValues(new Uint32Array(1))[0]));
+      this.#newAppId();
     }
     this.#broadcast({ type: "info" });
+    if (tightened) this.#closeSockets(4001, "sign in again");
     return this.info();
+  }
+
+  // Visitor cookies and private booking links carry this id. A new one makes every old one useless:
+  // it changes when an app is created and when its answers are cleared.
+  #newAppId() {
+    this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('app_id', ?)", crypto.randomUUID().slice(0, 13));
+  }
+
+  #closeSockets(code, reason) {
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(code, reason);
+      } catch {}
+    }
+  }
+
+  // All the answers together, in bytes. Worked out once, then kept up to date in memory.
+  #stateBytes = null;
+  #stateTotal() {
+    this.#stateBytes ??= this.sql.exec(
+      "SELECT (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM state) + (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM pstate) AS b").one().b;
+    return this.#stateBytes;
+  }
+
+  // The history of every change. It is trimmed from the old end once it passes its ceilings.
+  #hist = null;
+  #log(key, value, who, at, visitor) {
+    this.sql.exec("INSERT INTO history (key, value, author, at, visitor) VALUES (?, ?, ?, ?, ?)", key, value, who, at, visitor);
+    if (this.#hist) {
+      this.#hist.n++;
+      this.#hist.b += byteLength(value);
+    } else {
+      this.#hist = this.sql.exec("SELECT count(*) AS n, coalesce(sum(length(CAST(value AS BLOB))), 0) AS b FROM history").one();
+    }
+    while (this.#hist.n > LIMITS.maxHistoryRows || this.#hist.b > LIMITS.maxHistoryBytes) {
+      const gone = this.sql.exec("DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY id LIMIT 25) RETURNING length(CAST(value AS BLOB)) AS b").toArray();
+      if (!gone.length) break;
+      this.#hist.n -= gone.length;
+      this.#hist.b -= gone.reduce((n, r) => n + r.b, 0);
+    }
+  }
+
+  historyCount() {
+    return this.sql.exec("SELECT count(*) AS n FROM history").one().n;
   }
 
   // visitor: that visitor's own answers (private apps); otherwise the shared answers.
@@ -169,26 +226,31 @@ export class AppStore extends DurableObject {
     if (visitor !== null && !VISITOR_RE.test(visitor)) return { error: "bad visitor" };
     visitor = this.#canon(visitor);
     const v = JSON.stringify(value === undefined ? null : value);
-    if (v.length > LIMITS.maxValueBytes) return { error: "value too large" };
+    const size = byteLength(v);
+    if (size > LIMITS.maxValueBytes) return { error: "value too large" };
+    const old = (visitor
+      ? this.sql.exec("SELECT length(CAST(value AS BLOB)) AS b FROM pstate WHERE visitor = ? AND key = ?", visitor, key)
+      : this.sql.exec("SELECT length(CAST(value AS BLOB)) AS b FROM state WHERE key = ?", key)).toArray()[0];
+    if (this.#stateTotal() - (old?.b || 0) + size > LIMITS.maxStateBytes) return { error: "this page can't hold any more" };
     if (visitor) {
-      const exists = this.sql.exec("SELECT 1 FROM pstate WHERE visitor = ? AND key = ?", visitor, key).toArray().length > 0;
+      const exists = Boolean(old);
       if (!exists) {
         if (this.sql.exec("SELECT count(*) AS n FROM pstate WHERE visitor = ?", visitor).one().n >= LIMITS.maxKeysPerVisitor) return { error: "too many keys" };
         if (this.sql.exec("SELECT count(*) AS n FROM pstate").one().n >= LIMITS.maxPrivateRows) return { error: "too many keys" };
       }
-    } else {
-      const exists = this.sql.exec("SELECT 1 FROM state WHERE key = ?", key).toArray().length > 0;
-      if (!exists && this.sql.exec("SELECT count(*) AS n FROM state").one().n >= LIMITS.maxKeys) return { error: "too many keys" };
-    }
+    } else if (!old && this.sql.exec("SELECT count(*) AS n FROM state").one().n >= LIMITS.maxKeys) return { error: "too many keys" };
     const at = new Date().toISOString();
-    const who = String(author || "anonymous").slice(0, LIMITS.maxAuthor);
+    // "Owner" is what the owner's own writes are signed with, so a visitor can't call themselves that.
+    let who = String(author || "anonymous").slice(0, LIMITS.maxAuthor);
+    if (!force && /^\s*owner\s*$/i.test(who)) who = "Owner (a visitor)";
     if (visitor) {
       this.sql.exec("INSERT OR REPLACE INTO pstate VALUES (?, ?, ?, ?, ?)", visitor, key, v, who, at);
       if (!force) this.sql.exec("UPDATE visits SET name = ? WHERE visitor = ?", who, visitor);
     } else {
       this.sql.exec("INSERT OR REPLACE INTO state VALUES (?, ?, ?, ?)", key, v, who, at);
     }
-    this.sql.exec("INSERT INTO history (key, value, author, at, visitor) VALUES (?, ?, ?, ?, ?)", key, v, who, at, visitor);
+    this.#stateBytes += size - (old?.b || 0);
+    this.#log(key, v, who, at, visitor);
     const row = { key, value: JSON.parse(v), author: who, at };
     this.#broadcast({ type: "set", row }, visitor);
     return { row };
@@ -197,13 +259,17 @@ export class AppStore extends DurableObject {
   // Clears answers, bookings and history (after testing, before sharing). Settings, limits and files stay.
   clearState() {
     this.sql.exec("DELETE FROM state; DELETE FROM pstate; DELETE FROM history; DELETE FROM visits; DELETE FROM aliases; DELETE FROM bookings; DELETE FROM booking_ips;");
+    this.#stateBytes = 0;
+    this.#hist = null;
+    // A clean slate: earlier visitors' cookies and private booking links stop working too.
+    this.#newAppId();
     this.#broadcast({ type: "reset" });
     return { ok: true };
   }
 
-  exportAll() {
+  exportAll(withHistory = true) {
     const parse = (r) => ({ ...r, value: JSON.parse(r.value) });
-    const history = this.sql.exec("SELECT id, key, value, author, at, visitor FROM history ORDER BY id").toArray().map(parse);
+    const history = withHistory ? this.sql.exec("SELECT id, key, value, author, at, visitor FROM history ORDER BY id").toArray().map(parse) : [];
     const private_state = this.sql.exec("SELECT visitor, key, value, author, at FROM pstate ORDER BY visitor, key").toArray().map(parse);
     const visits = this.sql.exec("SELECT visitor, first_at, last_at, visits, name, device FROM visits ORDER BY first_at").toArray();
     const merged = this.sql.exec("SELECT visitor, target, at FROM aliases ORDER BY at").toArray();
@@ -225,6 +291,7 @@ export class AppStore extends DurableObject {
        ON CONFLICT (visitor, key) DO UPDATE SET value = excluded.value, author = excluded.author, at = excluded.at WHERE excluded.at > pstate.at`,
       into, from);
     this.sql.exec("DELETE FROM pstate WHERE visitor = ?", from);
+    this.#stateBytes = null;
     this.sql.exec("UPDATE history SET visitor = ? WHERE visitor = ?", into, from);
     // Bookings move too; where both browsers booked the same thing, the one being kept wins and a place is freed.
     this.sql.exec("UPDATE OR IGNORE bookings SET visitor = ? WHERE visitor = ?", into, from);
@@ -240,6 +307,9 @@ export class AppStore extends DurableObject {
     this.sql.exec("DELETE FROM visits WHERE visitor = ?", from);
     this.sql.exec("UPDATE aliases SET target = ? WHERE target = ?", into, from);
     this.sql.exec("INSERT OR REPLACE INTO aliases VALUES (?, ?, ?)", from, into, new Date().toISOString());
+    // If both browsers had booked the same thing, a place has just come free.
+    const limits = this.limitsInfo();
+    if (Object.keys(limits).length) this.#broadcast({ type: "places", limits });
     // Open tabs: both reload their answers; `from`'s sockets close so they reconnect under the merged id.
     this.#broadcast({ type: "reset" }, into);
     this.#broadcast({ type: "reset" }, from);
@@ -282,7 +352,7 @@ export class AppStore extends DurableObject {
   }
 
   #bookingChanged(visitor, key, value, who) {
-    this.sql.exec("INSERT INTO history (key, value, author, at, visitor) VALUES (?, ?, ?, ?, ?)", key, JSON.stringify(value), who, new Date().toISOString(), visitor);
+    this.#log(key, JSON.stringify(value), who, new Date().toISOString(), visitor);
     this.#broadcast({ type: "places", limits: this.limitsInfo() });
     this.#broadcast({ type: "bookings" }, visitor);
   }
@@ -318,7 +388,8 @@ export class AppStore extends DurableObject {
     }
     const now = Date.now();
     this.sql.exec("DELETE FROM booking_ips WHERE at < ?", now - 864e5);
-    if (this.sql.exec("SELECT count(*) AS n FROM booking_ips WHERE ip = ?", ip).one().n >= LIMITS.bookingsPerIpPerDay) return { error: "too many bookings today", status: 429 };
+    const cap = Number(this.#meta().book_cap) || LIMITS.bookingsPerIpPerDay;
+    if (this.sql.exec("SELECT count(*) AS n FROM booking_ips WHERE ip = ?", ip).one().n >= cap) return { error: "too many bookings today", status: 429 };
     if (this.sql.exec("SELECT count(*) AS n FROM bookings WHERE limit_name = ?", limit).one().n >= row.places) return { error: "full", status: 409 };
     const id = this.sql.exec("INSERT INTO bookings (limit_name, visitor, name, email, note, at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id", limit, visitor, name, email || null, note || null, at).one().id;
     this.sql.exec("INSERT INTO booking_ips VALUES (?, ?)", ip, now);
@@ -345,7 +416,7 @@ export class AppStore extends DurableObject {
 
   // The private link shown after booking: it carries the visitor's id to another device.
   async mineLink(slug, origin, visitor) {
-    const t = await makeToken(this.env.SESSION_SECRET, { k: "mine", s: slug, v: this.#canon(visitor), e: Date.now() + VISITOR_DAYS * 864e5 });
+    const t = await makeToken(this.env.SESSION_SECRET, { k: "mine", s: slug, i: this.#meta().app_id, v: this.#canon(visitor), e: Date.now() + VISITOR_DAYS * 864e5 });
     return `${origin}/${slug}/_mine?t=${t}`;
   }
 
@@ -354,7 +425,10 @@ export class AppStore extends DurableObject {
   #writes = new Map();
   tooFast(visitor, ip) {
     const now = Date.now();
-    if (this.#writes.size > 5000) this.#writes.clear();
+    if (this.#writes.size > 5000) {
+      // Forget counters whose ten seconds are up; in a real flood, keep the per-address ones.
+      for (const [key, w] of this.#writes) if (now - w.start > RATE.windowMs || (this.#writes.size > 5000 && key.startsWith("v:"))) this.#writes.delete(key);
+    }
     let slow = false;
     for (const [key, max] of [[`v:${visitor}`, RATE.perVisitor], [`i:${ip}`, RATE.perIp]]) {
       if (key === "v:null") continue;
@@ -451,7 +525,7 @@ export class AppStore extends DurableObject {
   async putFilePiece({ path, type, etag, upload, part = 0, parts = 1 }, bytes) {
     if (bytes.byteLength > LIMITS.pieceBytes) return { error: "piece too large: send files in pieces of at most 1 MB", status: 413 };
     if (!Number.isInteger(part) || !Number.isInteger(parts) || parts < 1 || part < 0 || part >= parts) return { error: "bad piece numbers" };
-    if (parts * LIMITS.pieceBytes > LIMITS.maxFileBytes + LIMITS.pieceBytes) return { error: "file too large (25 MB at most)", status: 413 };
+    if (parts > Math.ceil(LIMITS.maxFileBytes / LIMITS.pieceBytes)) return { error: "file too large (25 MB at most)", status: 413 };
     if (parts > 1 && !/^[A-Za-z0-9-]{8,64}$/.test(upload || "")) return { error: "bad upload id" };
     const isNew = !this.fileMeta(path);
     if (isNew && this.sql.exec("SELECT count(*) AS n FROM files").one().n >= LIMITS.maxFiles) return { error: "too many files in this app" };
@@ -466,6 +540,10 @@ export class AppStore extends DurableObject {
       return { error: "some pieces of the file are missing: send it again" };
     }
     const others = this.sql.exec("SELECT coalesce(sum(size), 0) AS n FROM files WHERE path != ?", path).one().n;
+    if (got.size > LIMITS.maxFileBytes) {
+      this.sql.exec("DELETE FROM upload_pieces WHERE upload = ?", id);
+      return { error: "file too large (25 MB at most)", status: 413 };
+    }
     if (others + got.size > LIMITS.maxAppBytes) {
       this.sql.exec("DELETE FROM upload_pieces WHERE upload = ?", id);
       return { error: "this app's files would pass 250 MB", status: 413 };
@@ -496,6 +574,8 @@ export class AppStore extends DurableObject {
     }
     await this.ctx.storage.deleteAll();
     this.live = false;
+    this.#stateBytes = null;
+    this.#hist = null;
     return { ok: true, files_deleted: files };
   }
 
@@ -511,6 +591,7 @@ export class AppStore extends DurableObject {
   // tabs costs nothing.
   acceptSocket(visitor) {
     visitor = this.#canon(visitor);
+    if (this.ctx.getWebSockets().length >= LIMITS.maxSockets) return new Response("too many open pages", { status: 503 });
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server, visitor && VISITOR_RE.test(visitor) ? [visitor] : []);
     return new Response(null, { status: 101, webSocket: client });
