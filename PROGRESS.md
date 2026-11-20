@@ -2,7 +2,12 @@
 
 A short log so a new conversation can pick up. Written 20 November 2026.
 
-## Done (all on this Mac only: nothing is on Cloudflare or GitHub yet)
+## Done
+
+- **Step 6, Tom's instance (20 Nov, evening).** `boa setup --domain boa.tomd.org` deployed the Worker `boa` to his
+  Cloudflare account; `boa check` against https://boa.tomd.org passed all 179 checks; `boa doctor` is clean. It also
+  answers at boa.tom-9c4.workers.dev. No apps on it yet, and no home app. Settings are in `~/.config/boa/`; his app
+  folders default to `~/Documents/code/<app>/`. Nothing is on GitHub yet.
 
 - **Step 1, port from dwa.** Worker (`worker/`), `cli/boa` in Node with no packages, `scripts/smoke.js`. Same behaviour
   as dwa: password or open access, shared or private answers, visits, merge, live updates, one-time links with a
@@ -45,20 +50,19 @@ Tests: `node scripts/smoke.js --local` (179 checks) and `node scripts/test-setup
 
 ## Waiting on Tom
 
-1. **Step 6: yes to deploying his instance.** It would create, on his Cloudflare account (the only one Wrangler is
-   signed in to): a Worker called `boa` with two Durable Object classes (`AppStore`, `Registry`); a custom domain
-   `boa.tomd.org` on the tomd.org zone (a DNS record and certificate, made by Cloudflare); two Worker secrets. The
-   Worker would also answer at `boa.tom-9c4.workers.dev`, because `workers_dev = true`. On this Mac: `~/.config/boa/`,
-   the links `~/.claude/skills/boa` and `~/.local/bin/boa`. Command: `boa setup --domain boa.tomd.org --apps-dir <dir>`.
-   Checked read-only on 20 Nov: no Worker called `boa` exists, `boa.tomd.org` doesn't resolve, tomd.org is active on
-   the same account. dwa and with.tomd.org are not touched.
-   Open question for him: where his own boa apps' folders should live (`--apps-dir`). The guide lives in this repo.
-2. **Step 7: yes to publishing the guide** at boa.tomd.org/guide/ after he has looked at it locally
+1. **Step 7: yes to publishing the guide** at boa.tomd.org/guide/ after he has looked at it locally
    (`boa dev`, then `boa --local new guide --title "Build your own little apps" --open --private`, `boa --local push guide guide`).
-3. **Step 8: yes to creating the public repo `tomdyson/boa`**, pushing and tagging `v1`. Then a card-free Cloudflare
+   Then, for real: `boa new guide --title "Build your own little apps" --open --private`, `boa push guide guide`, `boa home guide`.
+2. **Step 8: yes to creating the public repo `tomdyson/boa`**, pushing and tagging `v1`. Then a card-free Cloudflare
    account to rehearse the guide on.
-4. **His call, raised but not acted on:** what to do with the old guide at with.tomd.org/build-your-own-apps/ (one friend is
+3. **His call, raised but not acted on:** what to do with the old guide at with.tomd.org/build-your-own-apps/ (one friend is
    partway through it and has hand-built his own version), and whether the guide should be removed from the dwa repo.
+
+## Seen on the day
+
+- Right after the deploy, this Mac's own DNS said boa.tomd.org didn't exist (the router remembers a "no such name"
+  answer for up to 30 minutes), while public DNS had it. The `boa` command got round it by asking Cloudflare's DNS;
+  a browser on the same network has to wait. A friend's first deploy may show the same thing.
 
 ## To verify in the rehearsal on a card-free account (can't be tested from here)
 
