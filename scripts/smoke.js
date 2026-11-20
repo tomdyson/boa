@@ -146,9 +146,10 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
   const s2 = `check-${tag}-b`;
   const s3 = `check-${tag}-c`;
   const s4 = `check-${tag}-d`;
+  const s5 = `check-${tag}-e`;
   const pw = `pw-${crypto.randomBytes(8).toString("hex")}`;
   const pw2 = `pw-${crypto.randomBytes(8).toString("hex")}`;
-  const made = [s1, s2, s3, s4];
+  const made = [s1, s2, s3, s4, s5];
   const admin = (method, p, body) => site.req(method, `/_admin${p}`, { admin: true, body });
   const exported = async (slug = s1) => (await admin("GET", `/apps/${slug}/export`)).json();
   // Use a one-time link as a person does: the Continue button on the page it opens posts its token.
@@ -513,6 +514,13 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     r = await admin("DELETE", `/apps/${s3}/owner-sessions`);
     check("signing every device out", r.status === 200 && (await site.req("GET", `${op}/data`, { headers: ownerJar })).status === 401, r.status);
     check("an unused owner link from before is dead too", (await site.req("GET", spare)).status === 410);
+    // An app is deleted and another made with the same name: the old owner sign-in must not open the new one.
+    await admin("PUT", `/apps/${s5}`, { title: "Check again", password: pw });
+    const oldOwner = { Cookie: pair(cookieFrom(await pressContinue(linkPath(await admin("POST", `/apps/${s5}/owner-links`, {}))), "boa_o")) };
+    const oldWorked = (await site.req("GET", `/${s5}/_owner/data`, { headers: oldOwner })).status === 200;
+    await admin("DELETE", `/apps/${s5}`);
+    await admin("PUT", `/apps/${s5}`, { title: "Check again", password: pw });
+    check("an owner sign-in doesn't carry over to a new app with a deleted app's name", oldWorked && (await site.req("GET", `/${s5}/_owner/data`, { headers: oldOwner })).status === 401);
     await book(bob, "yoga", { name: "Bob" });
     await admin("PUT", `/apps/${s3}`, { closed: true });
     check("closed: no booking or cancelling", (await book(ann, "yoga", { name: "Ann" })).status === 423 && (await cancel(bob, "yoga")).status === 423);

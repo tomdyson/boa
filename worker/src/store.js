@@ -142,7 +142,12 @@ export class AppStore extends DurableObject {
       if (v === null) this.sql.exec("DELETE FROM meta WHERE k = ?", k);
       else this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", k, String(v));
     }
-    if (!this.#meta().created_at) this.sql.exec("INSERT INTO meta VALUES ('created_at', ?)", new Date().toISOString());
+    if (!this.#meta().created_at) {
+      this.sql.exec("INSERT INTO meta VALUES ('created_at', ?)", new Date().toISOString());
+      // Owner sign-ins carry this number. It starts somewhere random, so a sign-in to an app that was
+      // deleted can't open a new app that is later given the same name.
+      this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('owner_gen', ?)", String(crypto.getRandomValues(new Uint32Array(1))[0]));
+    }
     this.#broadcast({ type: "info" });
     return this.info();
   }
