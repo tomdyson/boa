@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A few questions</title>
+<!-- Everything comes from boa itself: fonts, the page's styles (built by `boa push`), the boa library, then Alpine. Keep this order. -->
+<link rel="stylesheet" href="/_boa/fonts.css">
+<link rel="stylesheet" href="app.css">
+<script src="_boa.js"></script>
+<script defer src="/_boa/alpine.js"></script>
+<style>
+  :root { --paper: #FAF5EE; --terracotta: #E76F51; --emerald: #2A9D8F; --ink: #2B2B2B; }
+  body { font-family: 'Inter', system-ui, sans-serif; color: var(--ink); background-color: var(--paper);
+         background-image: repeating-linear-gradient(135deg, rgba(231,111,81,0.045) 0 2px, transparent 2px 18px); }
+  .serif { font-family: 'Gowun Batang', Georgia, serif; letter-spacing: -0.01em; }
+  .card { background: white; border-radius: 18px; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px -8px rgba(0,0,0,.08); }
+  [x-cloak] { display: none !important; }
+</style>
+</head>
+<body x-data="page" class="min-h-screen">
+<main class="mx-auto max-w-2xl px-4 py-8 sm:px-6 sm:py-12">
+
+  <header class="mb-8">
+    <p class="text-sm text-stone-500">From Sam · January 2027</p>
+    <h1 class="serif mt-1 text-3xl sm:text-4xl">Dinner in January</h1>
+    <p class="mt-3 text-stone-600 leading-relaxed">One or two plain sentences on what this is for, and when you need answers by.</p>
+    <div class="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-stone-600" x-cloak x-show="$store.boa.ready">
+      <span><strong x-text="$store.boa.count(questions.map(q => q.id + '.choice'))"></strong> of <span x-text="questions.length"></span> answered</span>
+      <span x-show="$store.boa.me">You're answering as <strong x-text="$store.boa.me"></strong>
+        <button type="button" class="underline decoration-stone-300 underline-offset-2 hover:decoration-stone-600" @click="$store.boa.rename()">change</button></span>
+    </div>
+  </header>
+
+  <p x-cloak x-show="$store.boa.error" x-text="$store.boa.error" role="alert"
+     class="sticky top-2 z-10 mb-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800 outline outline-1 outline-red-200"></p>
+
+  <template x-for="(q, i) in questions" :key="q.id">
+    <section class="card mb-6 p-5 sm:p-7" :id="q.id">
+      <p class="text-xs font-semibold uppercase tracking-wide text-stone-400">Question <span x-text="i + 1"></span></p>
+      <h2 class="serif mt-1 text-xl sm:text-2xl" x-text="q.title"></h2>
+      <p class="mt-2 text-[0.95rem] leading-relaxed text-stone-700" x-show="q.intro" x-text="q.intro"></p>
+
+      <fieldset class="mt-4 grid gap-2" :disabled="$store.boa.closed">
+        <legend class="sr-only" x-text="q.title"></legend>
+        <template x-for="opt in q.options" :key="opt.key">
+          <label class="flex cursor-pointer gap-3 rounded-xl p-3.5 outline outline-1 outline-stone-200 transition hover:bg-stone-50
+                        has-[:checked]:bg-orange-50 has-[:checked]:outline-2 has-[:checked]:outline-[var(--terracotta)]">
+            <input type="radio" class="mt-1 h-4 w-4 shrink-0 accent-[var(--terracotta)]" :name="q.id" :value="opt.key"
+                   :checked="$store.boa.val(q.id + '.choice') === opt.key" @change="$store.boa.save(q.id + '.choice', opt.key)">
+            <span class="text-[0.95rem] leading-relaxed"><strong class="font-semibold" x-text="opt.label"></strong>
+              <span class="text-stone-600" x-show="opt.detail" x-text="opt.detail"></span></span>
+          </label>
+        </template>
+      </fieldset>
+      <p class="mt-2 text-xs text-stone-500" x-show="$store.boa.has(q.id + '.choice')"
+         x-text="'Chosen by ' + $store.boa.by(q.id + '.choice') + ', ' + $store.boa.ago(q.id + '.choice')"></p>
+
+      <label class="mt-5 block text-sm font-medium" :for="q.id + '-note'">Anything to add?</label>
+      <!-- Text boxes always use boaText: it saves a moment after typing stops, and someone else's
+           change can't overwrite what a person is in the middle of typing. -->
+      <textarea :id="q.id + '-note'" rows="3" x-data="boaText(q.id + '.note')" x-model="draft" x-bind="field"
+                class="mt-1.5 w-full rounded-xl p-3 text-base sm:text-sm outline outline-1 outline-stone-300 focus:outline-2 focus:outline-[var(--terracotta)] disabled:bg-stone-50"></textarea>
+      <p class="mt-1 h-4 text-xs text-stone-500"
+         x-text="$store.boa.saving[q.id + '.note'] ? 'Saving…' : ($store.boa.has(q.id + '.note') ? 'Last edited by ' + $store.boa.by(q.id + '.note') + ', ' + $store.boa.ago(q.id + '.note') : '')"></p>
+    </section>
+  </template>
+
+  <!-- For a shared app. For a private one say: "Answers save as you go. Only you and Sam can see yours." -->
+  <footer class="mt-10 text-center text-xs text-stone-400">Answers save as you go. Everyone with this page sees them.</footer>
+</main>
+
+<script>
+document.addEventListener("alpine:init", () => {
+  Alpine.data("page", () => ({
+    // Answers are stored under these ids (date.choice, date.note). Once the page has been shared,
+    // never change an id or an option's key: add new ones instead.
+    questions: [
+      {
+        id: "date",
+        title: "Which Saturday suits you best?",
+        intro: "Say what the choice is about, and anything that would help someone decide.",
+        options: [
+          { key: "jan-9", label: "Saturday 9 January." },
+          { key: "jan-16", label: "Saturday 16 January.", detail: "A short note on what choosing this means, if it needs one." },
+          { key: "discuss", label: "Not sure yet, let's discuss." },
+        ],
+      },
+      {
+        id: "food",
+        title: "What would you like to bring?",
+        options: [
+          { key: "starter", label: "A starter." },
+          { key: "pudding", label: "A pudding." },
+          { key: "drinks", label: "Something to drink." },
+          { key: "discuss", label: "Not sure yet, let's discuss." },
+        ],
+      },
+    ],
+  }));
+});
+</script>
+</body>
+</html>

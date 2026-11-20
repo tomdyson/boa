@@ -544,4 +544,16 @@ export class Registry extends DurableObject {
   list() {
     return this.sql.exec("SELECT slug FROM apps ORDER BY created_at DESC").toArray().map((r) => r.slug);
   }
+
+  // The app that the bare address (no app name) leads to, if one has been chosen.
+  home() {
+    return this.sql.exec("SELECT v FROM settings WHERE k = 'home'").toArray()[0]?.v || null;
+  }
+
+  setHome(slug) {
+    if (slug === null) this.sql.exec("DELETE FROM settings WHERE k = 'home'");
+    else if (!this.sql.exec("SELECT 1 FROM apps WHERE slug = ?", slug).toArray().length) return { error: "no such app" };
+    else this.sql.exec("INSERT OR REPLACE INTO settings VALUES ('home', ?)", slug);
+    return { home: this.home() };
+  }
 }

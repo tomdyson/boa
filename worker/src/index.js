@@ -56,7 +56,12 @@ export default {
         return await admin(req, env, url, decoded);
       }
       const slug = parts[0];
-      if (!slug || !SLUG_RE.test(slug)) return notFoundPage();
+      if (!slug) {
+        // The bare address leads to the home app, if `boa home` has chosen one.
+        const home = await registry(env).home();
+        return home ? Response.redirect(`${url.origin}/${home}/`, 302) : notFoundPage();
+      }
+      if (!SLUG_RE.test(slug)) return notFoundPage();
       if (url.pathname === `/${slug}`) return Response.redirect(`${url.origin}/${slug}/${url.search}`, 302);
       return await appStub(env, slug).fetch(req);
     } catch (e) {
@@ -70,7 +75,13 @@ export default {
 async function admin(req, env, url, parts) {
   const [resource, slug, sub, ...rest] = parts;
   const m = req.method;
-  if (!resource && m === "GET") return json({ version: VERSION });
+  if (!resource && m === "GET") return json({ version: VERSION, home: await registry(env).home() });
+  if (resource === "home" && m === "PUT") {
+    const body = (await req.json().catch(() => null)) || {};
+    if (body.slug !== null && !SLUG_RE.test(String(body.slug || ""))) return err("bad name", 400);
+    const r = await registry(env).setHome(body.slug);
+    return r.error ? err(r.error, 404) : json(r);
+  }
   if (resource !== "apps") return err("not found", 404);
 
   if (!slug) {

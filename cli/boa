@@ -100,10 +100,13 @@ function passphrase() {
   return `${word()}-${word()}-${word()}-${crypto.randomInt(10, 100)}`;
 }
 
-function savePassword(base, slug, password) {
+// Passwords are remembered by app name, so they survive a move to a new address. The practice
+// copy's are kept apart from the real ones.
+const pwKey = (c, slug) => (c.local ? `local:${slug}` : slug);
+function savePassword(c, slug, password) {
   const data = readJson(PASSWORDS, {});
-  if (password === null) delete data[`${base}/${slug}`];
-  else data[`${base}/${slug}`] = password;
+  if (password === null) delete data[pwKey(c, slug)];
+  else data[pwKey(c, slug)] = password;
   writePrivate(PASSWORDS, JSON.stringify(data, null, 2) + "\n");
 }
 
@@ -236,12 +239,22 @@ async function cmdNew(c, a) {
   const expires = a.days ? closingDate(Number(a.days)) : null;
   const limits = parseLimits(a.limit);
   const r = await c.call("PUT", `/apps/${slug}`, { json: { title: a.title, password, expires_at: expires, open: Boolean(a.open), private: Boolean(a.private), limits } });
-  savePassword(c.base, slug, password);
+  savePassword(c, slug, password);
   const access = a.open ? "open: no password, anyone with the address can use it" : `password: ${password}`;
   const answers = a.private ? "private: each visitor sees only their own" : "shared: everyone sees everyone's";
   console.log(`Created ${c.base}/${slug}/\n  title:    ${r.title}\n  access:   ${access}\n  answers:  ${answers}\n  closes:   ${expires ? `${expires.slice(0, 10)} (read-only after)` : "when you close it"}`);
   for (const line of limitLines(r.limits)) console.log(`  places:   ${line}`);
-  console.log(`\nNext: \`boa push ${slug}\`, check it with \`boa link ${slug}\`, then share ${a.open ? "the address" : "the address and password"}.`);
+  if (a.template) {
+    const src = path.join(REPO, "templates", a.template);
+    const dest = path.join(appsDir(), slug);
+    if (!fs.existsSync(path.join(src, "index.html"))) console.log(`\nNo template called "${a.template}": there are ${fs.readdirSync(path.join(REPO, "templates")).join(", ")}.`);
+    else if (fs.existsSync(dest)) console.log(`\n${dest} already exists, so the template wasn't copied over it.`);
+    else {
+      fs.cpSync(src, dest, { recursive: true });
+      console.log(`\nStarting page (${a.template}) copied to ${dest}`);
+    }
+  }
+  console.log(`\nNext: write the page in ${path.join(appsDir(), slug)}, \`boa push ${slug}\`, check it with \`boa link ${slug}\`, then share ${a.open ? "the address" : "the address and password"}.`);
 }
 
 // Tailwind runs through npx at a pinned version. Its stylesheet can't be found by name from an
@@ -309,7 +322,16 @@ async function cmdPush(c, a) {
   for (const h of htmls) for (const m of h.matchAll(/<(?:script|link)\b[^>]*?\b(?:src|href)=["'](https?:\/\/[^"'/]+)/gi)) outside.add(m[1]);
   if (outside.size) console.log(`  warning: the page loads files from ${[...outside].join(", ")}. Use /_boa/alpine.js and /_boa/fonts.css instead, so it depends on nobody else.`);
 
-  const files = walk(dir);
+  // A sign-up page keeps its numbers of places beside it, in limits.json: {"tue-12-jan": 12, …}.
+  const limitsFile = path.join(dir, "limits.json");
+  if (fs.existsSync(limitsFile)) {
+    const limits = readJson(limitsFile, null);
+    if (!limits || typeof limits !== "object" || Array.isArray(limits)) die("limits.json should look like {\"tue-12-jan\": 12}: a name and a number of places for each thing people can book");
+    const r = await c.call("PUT", `/apps/${slug}`, { json: { limits } });
+    for (const line of limitLines(r.limits)) console.log(`  places: ${line}`);
+  }
+
+  const files = walk(dir).filter((f) => f !== "limits.json");
   const remote = Object.fromEntries((await c.call("GET", `/apps/${slug}/files`)).map((f) => [f.path, f.etag]));
   let uploaded = 0;
   for (const rel of files) {
@@ -440,7 +462,7 @@ async function cmdLs(c) {
 async function cmdInfo(c, a) {
   const slug = a._[0];
   const x = await c.app(slug);
-  let pw = readJson(PASSWORDS, {})[`${c.base}/${slug}`] || `(not recorded on this computer: \`boa password ${slug}\` sets a new one)`;
+  let pw = readJson(PASSWORDS, {})[pwKey(c, slug)] || `(not recorded on this computer: \`boa password ${slug}\` sets a new one)`;
   if (x.open) pw = `none needed (open; \`boa password ${slug}\` puts one back)`;
   console.log(`${x.title}\n  address:  ${c.base}/${slug}/\n  password: ${pw}\n  answers:  ${x.answers} (last ${when(x.last_at)})` +
     `\n  closes:   ${x.closed ? "closed now" : (x.expires_at || "").slice(0, 10) || "when you close it"}`);
@@ -506,7 +528,7 @@ async function cmdPassword(c, a) {
   await c.app(slug);
   const password = a.password || passphrase();
   await c.call("PUT", `/apps/${slug}`, { json: { password, open: false } });
-  savePassword(c.base, slug, password);
+  savePassword(c, slug, password);
   console.log(`New password for ${slug}: ${password}\nEveryone signed in to it has been signed out, and it needs the password again.`);
 }
 
@@ -581,7 +603,7 @@ async function cmdRm(c, a) {
   await confirm(slug, "permanently delete", a.yes);
   const out = await exportToFile(c, slug);
   const r = await c.call("DELETE", `/apps/${slug}`);
-  savePassword(c.base, slug, null);
+  savePassword(c, slug, null);
   console.log(`Deleted ${slug} from the internet (${plural(r.files_deleted, "file")}). Its answers were saved first to ${out}`);
 }
 
@@ -641,18 +663,472 @@ function cmdDev() {
   process.exitCode = wrangler(["dev", "--port", String(LOCAL_PORT), "--ip", "127.0.0.1"]).status ?? 1;
 }
 
-function cmdDeploy() {
-  const cfg = loadConfig();
+// --- setting up and looking after boa -----------------------------------------------------------
+
+const say = (line = "") => console.log(line);
+// A path as people write it: ~/Apps/boa rather than /Users/sam/Apps/boa.
+function home(p) {
+  let real = os.homedir();
+  try {
+    real = fs.realpathSync(real);
+  } catch {}
+  return p.replace(real, "~").replace(os.homedir(), "~");
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function nodeIsNewEnough() {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  return major > 22 || (major === 22 && minor >= 12);
+}
+
+// Wrangler with its output caught rather than shown: for questions, and so a deploy's noise stays out of the way.
+function wranglerQuiet(args) {
+  return wrangler(args, { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+}
+
+// Who Wrangler is signed in as: {email, accounts: [{id, name}]}, or null if it isn't signed in.
+function whoami() {
+  try {
+    const j = JSON.parse(wranglerQuiet(["whoami", "--json"]).stdout);
+    return j.loggedIn ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cloudflare(token, method, pathname, body) {
+  try {
+    const r = await fetch(`https://api.cloudflare.com/client/v4${pathname}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: r.status, ...(await r.json().catch(() => ({}))) };
+  } catch (e) {
+    return { status: 0, errors: [{ message: e.message }] };
+  }
+}
+
+// Every Worker's address ends <something>.workers.dev, and a new Cloudflare account hasn't chosen
+// its <something> yet. Find it, or set it to the name the person picked. Never let Wrangler pick.
+// Returns the subdomain, or null when it can't be checked from here (the deploy then finds out).
+async function workersSubdomain(accountId, wanted) {
+  let token;
+  try {
+    token = JSON.parse(wranglerQuiet(["auth", "token", "--json"]).stdout).token;
+  } catch {}
+  if (!token) return null;
+  const got = await cloudflare(token, "GET", `/accounts/${accountId}/workers/subdomain`);
+  if (got.success && got.result?.subdomain) return got.result.subdomain;
+  // Only a clear "there isn't one" lets us set it: setting it on an account that has one would rename it.
+  const none = (got.success && !got.result?.subdomain) || got.status === 404 || (got.errors || []).some((e) => e.code === 10007);
+  if (!none) return null;
+  const rules = "Lowercase letters, digits and hyphens only. It shows in every app's address: boa.<name>.workers.dev.";
+  let name = wanted;
+  if (!name && process.stdin.isTTY) name = await ask(`Your Cloudflare account needs a name for its web addresses.\n${rules}\nName: `);
+  if (!name) {
+    die("this Cloudflare account hasn't chosen its workers.dev name yet.\n" +
+      "  Ask the person what they'd like: their own name or a nickname, something they're happy for friends to see.\n" +
+      `  ${rules}\n  Then run: boa setup --subdomain <name>`);
+  }
+  name = name.toLowerCase();
+  if (!/^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$/.test(name)) die(`"${name}" can't be used. ${rules}`);
+  if (name === "boa") die("not \"boa\": the address would be boa.boa.workers.dev. Pick the person's name or a nickname.");
+  const set = await cloudflare(token, "PUT", `/accounts/${accountId}/workers/subdomain`, { subdomain: name });
+  if (!set.success) {
+    die(`Cloudflare wouldn't accept "${name}" (${(set.errors || []).map((e) => e.message).join("; ") || `status ${set.status}`}).\n` +
+      "  Someone else may already have that name. Ask for another and run: boa setup --subdomain <name>");
+  }
+  say(`  Your Cloudflare addresses will end ${name}.workers.dev`);
+  return name;
+}
+
+// Put the Worker on the internet, with its two keys. The keys go through a private file that is
+// deleted straight afterwards, never the command line. Returns {ok, output}.
+function deployWorker(cfg) {
   const args = ["deploy"];
+  const secrets = path.join(CONFIG_DIR, `.keys-${process.pid}.json`);
+  if (cfg.admin_token && cfg.session_secret) {
+    writePrivate(secrets, JSON.stringify({ ADMIN_TOKEN: cfg.admin_token, SESSION_SECRET: cfg.session_secret }));
+    args.push("--secrets-file", secrets);
+  }
   if (cfg.domain) args.push("--domains", cfg.domain);
-  process.exitCode = wrangler(args).status ?? 1;
+  try {
+    const r = wranglerQuiet(args);
+    return { ok: r.status === 0, output: `${r.stdout || ""}\n${r.stderr || ""}` };
+  } finally {
+    fs.rmSync(secrets, { force: true });
+  }
+}
+
+// A brand-new address can take a few minutes to start answering.
+async function waitForWorker(base, token, minutes = 5) {
+  const until = Date.now() + minutes * 60e3;
+  let told = false;
+  while (Date.now() < until) {
+    try {
+      const r = await request(base, "GET", "/_admin", { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+      if (r.status === 200) return JSON.parse(r.body.toString("utf8"));
+    } catch {}
+    if (!told) say("  Waiting for the address to start working (a new one can take a few minutes)…");
+    told = true;
+    await sleep(4000);
+  }
+  return null;
+}
+
+// Claude finds skills in ~/.claude/skills. Link ours there, so it follows the boa folder as it updates.
+function linkSkill() {
+  const dest = path.join(os.homedir(), ".claude", "skills", "boa");
+  const target = path.join(REPO, "skill");
+  const st = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (st && !st.isSymbolicLink()) return `left alone: ${home(dest)} is a real folder, not a link to ${home(target)}`;
+  if (st) fs.unlinkSync(dest);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.symlinkSync(target, dest);
+  return `linked at ${home(dest)}`;
+}
+
+// Make `boa` a command that works from anywhere: a link in ~/.local/bin, and that folder on the PATH.
+function linkCommand() {
+  const bin = path.join(os.homedir(), ".local", "bin");
+  const dest = path.join(bin, "boa");
+  const st = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (st && !st.isSymbolicLink()) return `left alone: ${home(dest)} is a real file, not a link`;
+  if (st) fs.unlinkSync(dest);
+  fs.mkdirSync(bin, { recursive: true });
+  fs.symlinkSync(path.join(REPO, "cli", "boa"), dest);
+  if ((process.env.PATH || "").split(":").includes(bin)) return `linked at ${home(dest)}`;
+  const mentioned = [".zshrc", ".zprofile", ".zshenv"].some((f) => readText(path.join(os.homedir(), f)).includes(".local/bin"));
+  if (!mentioned) fs.appendFileSync(path.join(os.homedir(), ".zshrc"), '\n# Added by boa setup, so the "boa" command can be found\nexport PATH="$HOME/.local/bin:$PATH"\n');
+  return `linked at ${home(dest)}. New Terminal windows and new Claude sessions will find it; until then use ${home(path.join(REPO, "cli", "boa"))}`;
+}
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function runChecks(base, token, verbose) {
+  const { run } = require(path.join(REPO, "scripts", "smoke.js"));
+  say("Checking that everything works. This takes about half a minute: it makes a few test apps, uses them as visitors would, and deletes them.");
+  const { failures } = await run(base, token, { quiet: !verbose });
+  return failures.length === 0;
+}
+
+async function cmdSetup(_c, a) {
+  if (a.from) return restore(a);
+  say(`Setting up boa ${VERSION}.\n`);
+  if (!nodeIsNewEnough()) die(`this Mac has Node.js ${process.versions.node}, and boa needs 22.12 or newer. Install the current LTS version from nodejs.org, then run setup again.`);
+  say(`  Node.js ${process.versions.node}: fine`);
+  const cfg = loadConfig();
+  if (a["apps-dir"]) cfg.apps_dir = path.resolve(a["apps-dir"].replace(/^~(?=\/|$)/, os.homedir()));
+  // The two keys are made once and kept. Running setup again must never change them, or every
+  // sign-in and every app's link to this computer would break.
+  const fresh = !cfg.set_up_at;
+  cfg.admin_token ||= crypto.randomBytes(32).toString("hex");
+  cfg.session_secret ||= crypto.randomBytes(32).toString("hex");
+
+  if (a.local) {
+    ensureDevVars();
+    cfg.base_url = LOCAL_BASE;
+    cfg.admin_token = readEnvFile(path.join(WORKER, ".dev.vars")).ADMIN_TOKEN;
+    saveConfig(cfg);
+    if (!(await waitForWorker(cfg.base_url, cfg.admin_token, 0.2))) die(`the practice copy isn't running: start it with \`boa dev\` in another window, then run \`boa setup --local\` again`);
+    say(`  Using the practice copy on this computer at ${LOCAL_BASE} (nothing is put on the internet)`);
+  } else {
+    say("  Checking the Cloudflare sign-in (the first time, this fetches Cloudflare's tool and can take a minute)…");
+    const me = whoami();
+    if (!me) {
+      die("this Mac isn't connected to a Cloudflare account yet.\n" +
+        `  Run: npx -y ${WRANGLER} login\n  A browser window opens: check it shows the right account, click Allow, then run \`boa setup\` again.`);
+    }
+    const accounts = me.accounts || [];
+    const account = a.account ? accounts.find((x) => x.id === a.account || x.name === a.account) : accounts.length === 1 ? accounts[0] : null;
+    if (!account) {
+      die((a.account ? `the Cloudflare sign-in can't see an account "${a.account}".` : `the Cloudflare sign-in can see ${accounts.length} accounts, so say which one boa should use.`) +
+        `\n${accounts.map((x) => `  ${x.id}  ${x.name}`).join("\n")}\n  Run: boa setup --account <id>`);
+    }
+    if (cfg.account_id && cfg.account_id !== account.id) die(`boa on this Mac is already set up on a different Cloudflare account (${cfg.account_id}). To move it, remove ${home(CONFIG_DIR)} first (after a \`boa backup\`).`);
+    say(`  Cloudflare: signed in${me.email ? ` as ${me.email}` : ""}, account "${account.name}"`);
+    cfg.account_id = account.id;
+    if (a.domain) cfg.domain = a.domain.replace(/^https?:\/\//, "").replace(/\/.*$/, "").toLowerCase();
+    saveConfig(cfg);
+
+    const sub = await workersSubdomain(account.id, a.subdomain);
+    if (sub) cfg.subdomain = sub;
+    say(`  Putting boa on the internet${cfg.domain ? ` at ${cfg.domain}` : ""} (about a minute)…`);
+    const d = deployWorker(cfg);
+    if (!d.ok) {
+      const noSub = /workers\.dev subdomain|register a workers\.dev/i.test(d.output);
+      die("Cloudflare didn't accept the Worker.\n" +
+        (noSub ? "  The account hasn't chosen its workers.dev name. Ask the person for one, then run: boa setup --subdomain <name>\n" : "") +
+        d.output.trim().split("\n").slice(-25).map((l) => `  | ${l}`).join("\n"));
+    }
+    const found = cfg.subdomain ? `https://boa.${cfg.subdomain}.workers.dev` : (d.output.match(/https:\/\/boa\.[a-z0-9-]+\.workers\.dev/) || [])[0];
+    cfg.base_url = cfg.domain ? `https://${cfg.domain}` : found;
+    if (!cfg.base_url) die(`the Worker went up but its address wasn't in Cloudflare's reply:\n${d.output.trim().split("\n").slice(-15).join("\n")}`);
+    saveConfig(cfg);
+    const up = await waitForWorker(cfg.base_url, cfg.admin_token);
+    if (!up) {
+      die(`boa is on Cloudflare, but ${cfg.base_url} isn't answering yet. ${cfg.domain ? "A new custom address can take a while to get its certificate. " : ""}` +
+        "Wait five minutes, then run `boa doctor`. Nothing needs doing again.");
+    }
+    say(`  boa ${up.version} is answering at ${cfg.base_url}`);
+  }
+
+  say(`  Claude skill: ${linkSkill()}`);
+  say(`  boa command: ${linkCommand()}`);
+  say();
+  const ok = await runChecks(cfg.base_url, cfg.admin_token, a.verbose);
+  say();
+  if (!ok) die("setup finished, but some checks failed (listed above). Run `boa check --verbose` for the detail, and `boa doctor`.");
+  if (fresh) saveConfig({ ...loadConfig(), set_up_at: new Date().toISOString() });
+  say(`boa is ${fresh ? "set up" : "set up (it already was: nothing was replaced)"}.`);
+  say(`  Your apps' addresses start:  ${cfg.base_url}/`);
+  say(`  Page files for each app go in: ${home(appsDir())}/<app>/`);
+  say(`  Settings and keys:           ${home(CONFIG_DIR)}/ (private: never share or print them)`);
+  say("\nNext: start a new Claude session and ask for an app, for example");
+  say('  "Using the boa skill, make me a page where friends can pick dates for dinner."');
+}
+
+// boa setup --from <backup.zip>: a new Mac takes over an existing boa. Nothing is deployed.
+async function restore(a) {
+  const zip = path.resolve(a.from.replace(/^~(?=\/|$)/, os.homedir()));
+  if (!fs.existsSync(zip)) die(`there is no file at ${zip}`);
+  const existing = loadConfig();
+  if (existing.admin_token && !a.force) die(`boa is already set up on this Mac (${existing.base_url}). To replace its settings with the backup's, add --force.`);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "boa-restore-"));
+  try {
+    if (spawnSync("unzip", ["-q", zip, "-d", tmp]).status !== 0) die("that file couldn't be opened as a zip");
+    const root = path.join(tmp, "boa-backup");
+    const cfg = readJson(path.join(root, "settings", "config.json"), null);
+    if (!cfg?.admin_token || !cfg.base_url) die("that zip isn't a boa backup (it has no settings in it)");
+    delete cfg.apps_dir; // where apps live is about this Mac, not the old one
+    if (a["apps-dir"]) cfg.apps_dir = path.resolve(a["apps-dir"].replace(/^~(?=\/|$)/, os.homedir()));
+    saveConfig(cfg);
+    writePrivate(PASSWORDS, JSON.stringify(readJson(path.join(root, "settings", "passwords.json"), {}), null, 2) + "\n");
+    say(`Settings and keys restored to ${home(CONFIG_DIR)}/`);
+    const apps = path.join(root, "apps");
+    for (const name of fs.existsSync(apps) ? fs.readdirSync(apps) : []) {
+      const dest = path.join(appsDir(), name);
+      if (fs.existsSync(dest)) say(`  kept your existing ${home(dest)}`);
+      else {
+        fs.cpSync(path.join(apps, name), dest, { recursive: true });
+        say(`  restored ${home(dest)}`);
+      }
+    }
+    say(`Claude skill: ${linkSkill()}`);
+    say(`boa command: ${linkCommand()}\n`);
+    const up = await waitForWorker(cfg.base_url, cfg.admin_token, 0.3);
+    if (!up) die(`the settings are back, but ${cfg.base_url} isn't answering. Check the internet connection and run \`boa doctor\`.`);
+    say(`This Mac now looks after boa at ${cfg.base_url} (${plural((await new Client(false).call("GET", "/apps")).length, "app")}). Nothing was changed on Cloudflare.`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function cmdCheck(c, a) {
+  if (!(await runChecks(c.base, c.token, a.verbose))) process.exitCode = 1;
+}
+
+function git(args) {
+  return spawnSync("git", args, { cwd: REPO, encoding: "utf8" });
+}
+
+// The newest release: the highest tag that looks like v1, v2, v1.2 …
+function latestTag() {
+  return git(["tag", "--list", "v[0-9]*", "--sort=-v:refname"]).stdout.split("\n").filter(Boolean)[0] || null;
+}
+
+async function cmdDoctor(c0, a) {
+  const problems = [];
+  const good = (line) => say(`  ok       ${line}`);
+  const bad = (line, fix) => {
+    say(`  PROBLEM  ${line}\n           -> ${fix}`);
+    problems.push(line);
+  };
+  const note = (line) => say(`  note     ${line}`);
+  say(`boa ${VERSION} in ${home(REPO)}\n`);
+
+  if (nodeIsNewEnough()) good(`Node.js ${process.versions.node}`);
+  else bad(`Node.js ${process.versions.node} is too old`, "install the current LTS version from nodejs.org (boa needs 22.12 or newer)");
+
+  const cfg = loadConfig();
+  const local = a.local;
+  if (!local && !cfg.admin_token) bad("boa isn't set up on this Mac", "run `boa setup`, or `boa setup --from <backup.zip>` if it was set up on another Mac");
+  else if (!local) {
+    for (const f of [CONFIG, PASSWORDS].filter((x) => fs.existsSync(x))) {
+      if (fs.statSync(f).mode & 0o077) {
+        fs.chmodSync(f, 0o600);
+        note(`${home(f)} could be read by other accounts on this Mac: fixed`);
+      }
+    }
+    good(`settings and keys in ${home(CONFIG_DIR)}/ are private`);
+  }
+
+  let base, token;
+  try {
+    ({ base, token } = new Client(local));
+  } catch {}
+  if (base) {
+    let res = null;
+    try {
+      res = await request(base, "GET", "/_admin", { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    } catch (e) {
+      bad(`${base} can't be reached (${e.code || e.message})`, local ? "start it with `boa dev`" : "check the internet connection; if that's fine, run `boa deploy`");
+    }
+    if (res?.status === 200) {
+      const w = JSON.parse(res.body.toString("utf8"));
+      good(`boa is answering at ${base}`);
+      if (w.version === VERSION) good(`the Worker and this folder are both version ${VERSION}`);
+      else bad(`the Worker is version ${w.version} but this folder is ${VERSION}`, "run `boa deploy`");
+      const apps = JSON.parse((await request(base, "GET", "/_admin/apps", { headers: { Authorization: `Bearer ${token}` } })).body.toString("utf8"));
+      note(`${plural(apps.length, "app")}${w.home ? `; the bare address leads to ${w.home}` : ""}`);
+    } else if (res?.status === 401) bad("the Worker refused this Mac's key", "restore the newest backup with `boa setup --from <backup.zip> --force`");
+    else if (res?.status === 503) bad("the Worker is there but has no keys", "run `boa deploy`");
+    else if (res) bad(`${base} answered with an error (${res.status})`, "wait a few minutes and try again; if it stays, run `boa deploy`");
+  }
+
+  const skill = path.join(os.homedir(), ".claude", "skills", "boa");
+  if (fs.existsSync(path.join(skill, "SKILL.md"))) good(`Claude skill at ${home(skill)}`);
+  else bad("Claude can't see the boa skill", "run `boa setup` again (it re-links the skill and changes nothing else)");
+
+  const onPath = (process.env.PATH || "").split(":").some((d) => {
+    try {
+      return fs.realpathSync(path.join(d, "boa")) === fs.realpathSync(__filename);
+    } catch {
+      return false;
+    }
+  });
+  if (onPath) good("the `boa` command is on the PATH");
+  else note(`the \`boa\` command isn't on this window's PATH. Use ${home(__filename)}, or run \`boa setup\` again and open a new window`);
+
+  if (!local) {
+    const me = whoami();
+    if (me) good(`Cloudflare sign-in works${me.email ? ` (${me.email})` : ""}: needed only for \`boa deploy\` and \`boa update\``);
+    else note(`this Mac isn't signed in to Cloudflare. Apps still work; before \`boa deploy\` or \`boa update\`, run: npx -y ${WRANGLER} login`);
+  }
+
+  if (fs.existsSync(path.join(REPO, ".git"))) {
+    if (git(["status", "--porcelain", "--untracked-files=no"]).stdout.trim()) note("files in the boa folder have been edited, so `boa update` will refuse until they're put back");
+    if (git(["fetch", "--tags", "--quiet"]).status === 0) {
+      const latest = latestTag();
+      const here = git(["describe", "--tags", "--exact-match"]).stdout.trim();
+      if (latest && here !== latest && git(["merge-base", "--is-ancestor", latest, "HEAD"]).status !== 0) note(`a newer boa is out (${latest}): run \`boa update\``);
+      else good("this is the newest boa");
+    } else note("couldn't look for a newer boa (no internet, or no git remote)");
+  } else note("the boa folder isn't a git clone, so `boa update` can't fetch new versions");
+
+  say(problems.length ? `\n${plural(problems.length, "problem")} to fix (see -> above).` : "\nEverything looks fine.");
+  if (problems.length) process.exitCode = 1;
+}
+
+async function cmdUpdate(_c, a) {
+  if (!fs.existsSync(path.join(REPO, ".git"))) die(`${home(REPO)} isn't a git clone, so there's nothing to fetch from. See the README's "Updating" section.`);
+  const edited = git(["status", "--porcelain", "--untracked-files=no"]).stdout.trim();
+  if (edited) die(`files in ${home(REPO)} have been edited, and an update would overwrite them:\n${edited}\nPut them back with \`git -C ${home(REPO)} checkout .\` (your apps are not in this folder and are not affected), then update again.`);
+  if (git(["fetch", "--tags", "--quiet"]).status !== 0) die("couldn't reach the place boa is fetched from. Check the internet connection and try again.");
+  const latest = latestTag();
+  if (!latest) die("no released version found to update to");
+  const before = git(["describe", "--tags", "--always"]).stdout.trim();
+  if (git(["merge-base", "--is-ancestor", latest, "HEAD"]).status === 0 && !a.redeploy) {
+    say(`boa is already up to date (${latest}).`);
+    return;
+  }
+  if (git(["merge-base", "--is-ancestor", latest, "HEAD"]).status !== 0) {
+    const r = git(["checkout", "--quiet", "--detach", latest]);
+    if (r.status !== 0) die(`couldn't switch to ${latest}:\n${r.stderr.trim()}`);
+    say(`Fetched boa ${latest} (was ${before}).`);
+  }
+  // The rest is done by the new version's own code, not this (old) copy still in memory.
+  const self = path.join(REPO, "cli", "boa");
+  for (const step of a.local ? [["check", "--local"]] : [["deploy"], ["check"]]) {
+    const r = spawnSync(process.execPath, [self, ...step], { stdio: "inherit" });
+    if (r.status !== 0) die(`the new version was fetched, but \`boa ${step[0]}\` didn't finish. Run \`boa doctor\`. To go back: git -C ${home(REPO)} checkout ${before} && boa deploy`);
+  }
+  say(`\nboa is now ${latest}. Your apps and their answers were not touched.`);
+}
+
+async function cmdDeploy() {
+  const cfg = loadConfig();
+  if (!cfg.admin_token) die("boa isn't set up on this Mac yet: run `boa setup`");
+  if (!whoami()) die(`this Mac isn't signed in to Cloudflare. Run: npx -y ${WRANGLER} login   then try again.`);
+  say("Putting this folder's version of boa on the internet (about a minute)…");
+  const d = deployWorker(cfg);
+  if (!d.ok) die(`Cloudflare didn't accept the Worker:\n${d.output.trim().split("\n").slice(-25).map((l) => `  | ${l}`).join("\n")}`);
+  // Old and new versions can both answer for a minute after a deploy: wait for the new one.
+  for (let i = 0; i < 30; i++) {
+    const up = await waitForWorker(cfg.base_url, cfg.admin_token, 1);
+    if (up?.version === VERSION) return say(`boa ${VERSION} is answering at ${cfg.base_url}. Apps and answers were not touched.`);
+    await sleep(3000);
+  }
+  die(`the Worker went up, but ${cfg.base_url} isn't answering as version ${VERSION} yet. Wait a few minutes and run \`boa doctor\`.`);
+}
+
+// One zip with everything needed to look after these apps from another Mac: the settings and keys,
+// each app's page files, and a copy of every app's answers as they are right now.
+async function cmdBackup(c, a) {
+  const dest = path.resolve((a._[0] || path.join(os.homedir(), "Documents")).replace(/^~(?=\/|$)/, os.homedir()));
+  if (!fs.existsSync(dest) || !fs.statSync(dest).isDirectory()) die(`${dest} isn't a folder`);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "boa-backup-"));
+  try {
+    const root = path.join(tmp, "boa-backup");
+    fs.mkdirSync(path.join(root, "settings"), { recursive: true });
+    fs.mkdirSync(path.join(root, "answers"));
+    fs.mkdirSync(path.join(root, "apps"));
+    for (const f of ["config.json", "passwords.json"]) if (fs.existsSync(path.join(CONFIG_DIR, f))) fs.copyFileSync(path.join(CONFIG_DIR, f), path.join(root, "settings", f));
+    const apps = await c.call("GET", "/apps");
+    const skip = (src) => !/(^|\/)(node_modules|\.git|\.DS_Store)$/.test(src);
+    let folders = 0;
+    for (const x of apps) {
+      fs.writeFileSync(path.join(root, "answers", `${x.slug}.json`), JSON.stringify(await c.call("GET", `/apps/${x.slug}/export`), null, 2) + "\n");
+      const src = path.join(appsDir(), x.slug);
+      if (fs.existsSync(path.join(src, "index.html"))) {
+        fs.cpSync(src, path.join(root, "apps", x.slug), { recursive: true, filter: skip });
+        folders++;
+      }
+    }
+    if (fs.existsSync(exportsDir())) fs.cpSync(exportsDir(), path.join(root, "apps", "boa-exports"), { recursive: true, filter: skip });
+    fs.writeFileSync(path.join(root, "README.txt"),
+      `boa backup, made ${new Date().toString()}\nFor ${c.base}\n\n` +
+      "This file holds the keys to your apps: anyone who has it can read every answer and change or delete every app. Keep it private.\n\n" +
+      "settings/  the keys and each app's password\napps/      each app's page files\nanswers/   a copy of every app's answers and bookings on the day of the backup\n\n" +
+      "To look after your apps from a new Mac: install boa (see its README), then run\n  boa setup --from <this zip file>\n");
+    const out = path.join(dest, `boa-backup-${stampNow()}.zip`);
+    const r = spawnSync("zip", ["-r", "-q", "-X", out, "boa-backup"], { cwd: tmp, encoding: "utf8" });
+    if (r.status !== 0) die(`couldn't write the zip: ${(r.stderr || "").trim()}`);
+    fs.chmodSync(out, 0o600);
+    say(`Backed up ${plural(apps.length, "app")} (${plural(folders, "folder")} of page files, and everyone's answers) to\n  ${out}`);
+    say("It holds the keys to your apps, so don't send it to anyone. To use it on a new Mac: boa setup --from <that file>");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function cmdHome(c, a) {
+  if (a.none) {
+    await c.call("PUT", "/home", { json: { slug: null } });
+    return say(`${c.base}/ no longer leads anywhere.`);
+  }
+  const slug = a._[0];
+  if (!slug) {
+    const h = (await c.call("GET", "")).home;
+    return say(h ? `${c.base}/ leads to ${h} (${c.base}/${h}/). \`boa home --none\` stops that.` : `${c.base}/ doesn't lead to an app. \`boa home <app>\` chooses one.`);
+  }
+  await c.app(slug);
+  await c.call("PUT", "/home", { json: { slug } });
+  say(`${c.base}/ now leads to ${c.base}/${slug}/`);
 }
 
 // --- the command line ---------------------------------------------------------------------------
 
 // name: [usage, one-line help, function, {flags that take a value}, {flags that don't}, needs a Worker?]
 const COMMANDS = {
-  new: ["<app> --title T [--open] [--private] [--limit name=places]... [--days N] [--password P]", "create an app (a password is made up unless it's open)", cmdNew, ["title", "password", "days"], ["open", "private"], true, ["limit"]],
+  new: ["<app> --title T [--template checklist|questionnaire|signup] [--open] [--private] [--limit name=places]... [--days N] [--password P]", "create an app (a password is made up unless it's open)", cmdNew, ["title", "password", "days", "template"], ["open", "private"], true, ["limit"]],
   settings: ["<app> [--title T] [--private|--shared] [--open] [--limit name=places]... [--remove-limit name]... [--closes DATE|--no-closing-date]", "show or change an app's settings", cmdSettings, ["title", "closes"], ["private", "shared", "open", "no-closing-date"], true, ["limit", "remove-limit"]],
   push: ["<app> [folder] [--no-css]", "build the page's styles and publish the folder's files", cmdPush, [], ["no-css"], true],
   link: ["<app> [--as NAME] [--minutes M] [--visitor ID]", "a one-time sign-in link, for previews or instead of a password", cmdLink, ["as", "minutes", "visitor"], [], true],
@@ -671,8 +1147,14 @@ const COMMANDS = {
   export: ["<app>", "save the answers and history to a file in boa-exports", cmdExport, [], [], true],
   reset: ["<app> [--yes]", "clear all answers and history (saves a copy first)", cmdReset, [], ["yes"], true],
   rm: ["<app> [--yes]", "delete an app for good (saves its answers first)", cmdRm, [], ["yes"], true],
+  home: ["[app] [--none]", "choose the app that the bare address leads to", cmdHome, [], ["none"], true],
+  setup: ["[--subdomain NAME] [--domain apps.example.com] [--account ID] [--apps-dir DIR] [--from backup.zip]", "set boa up on this Mac (safe to run again)", cmdSetup, ["subdomain", "domain", "account", "apps-dir", "from"], ["verbose", "force"], false],
+  doctor: ["", "look for problems and say how to fix them", cmdDoctor, [], [], false],
+  check: ["[--verbose]", "test everything end to end with throwaway apps (half a minute)", cmdCheck, [], ["verbose"], true],
+  update: ["[--redeploy]", "fetch the newest boa, put it on the internet and check it", cmdUpdate, [], ["redeploy"], false],
+  backup: ["[folder]", "save one zip of settings, page files and answers (default: Documents)", cmdBackup, [], [], true],
+  deploy: ["", "put this folder's version of the Worker on the internet", cmdDeploy, [], [], false],
   dev: ["", `run a practice copy of boa on this computer (port ${LOCAL_PORT}); use it with --local`, cmdDev, [], [], false],
-  deploy: ["", "put the Worker on the internet again (after changing it)", cmdDeploy, [], [], false],
 };
 
 function usage() {
