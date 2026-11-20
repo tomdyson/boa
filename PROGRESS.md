@@ -7,7 +7,11 @@ A short log so a new conversation can pick up. Written 20 November 2026.
 - **Step 6, Tom's instance (20 Nov, evening).** `boa setup --domain boa.tomd.org` deployed the Worker `boa` to his
   Cloudflare account; `boa check` against https://boa.tomd.org passed all 179 checks; `boa doctor` is clean. It also
   answers at boa.tom-9c4.workers.dev. No apps on it yet, and no home app. Settings are in `~/.config/boa/`; his app
-  folders default to `~/Documents/code/<app>/`. Nothing is on GitHub yet.
+  folders default to `~/Documents/code/<app>/`.
+- **Step 7, the guide, published (20 Nov).** `boa new guide --open --private`, `boa push guide guide`, `boa home guide`:
+  it is at https://boa.tomd.org/guide/ and the bare address leads to it. Checked live at desktop width and 375 px;
+  it loads nothing from other websites. To change it: edit `guide/index.html`, then `boa push guide guide`.
+- **Step 8, first half (20 Nov).** Public repo github.com/tomdyson/boa created, `main` pushed, tagged `v1`.
 
 - **Step 1, port from dwa.** Worker (`worker/`), `cli/boa` in Node with no packages, `scripts/smoke.js`. Same behaviour
   as dwa: password or open access, shared or private answers, visits, merge, live updates, one-time links with a
@@ -23,10 +27,10 @@ A short log so a new conversation can pick up. Written 20 November 2026.
   clone with a temporary home folder against a practice Worker.
 - **Step 5, skill, templates, README.** `skill/SKILL.md`; `templates/checklist`, `questionnaire`, `signup` (checked in
   the browser at desktop width and 375 px); `README.md`.
-- **Step 7, the guide, local only.** `guide/index.html`, ported from dwa's `apps/build-your-own-apps/` (including its
+- **Step 7, the guide, written.** `guide/index.html`, ported from dwa's `apps/build-your-own-apps/` (including its
   uncommitted wording). Naming step removed; old steps 5 and 6 replaced by one "Install boa" step; times now add up to
   65 minutes for steps 1 to 6; step ids are new (`accounts`, `claude-app`, `claude-code`, `cloudflare`, `install`,
-  `first-app`, `looking-after`, `own-domain`). Checked locally at desktop width and 375 px. **Not published.**
+  `first-app`, `looking-after`, `own-domain`). Checked locally at desktop width and 375 px.
 
 Tests: `node scripts/smoke.js --local` (179 checks) and `node scripts/test-setup.js` (28 checks), both against `boa dev`.
 
@@ -50,12 +54,9 @@ Tests: `node scripts/smoke.js --local` (179 checks) and `node scripts/test-setup
 
 ## Waiting on Tom
 
-1. **Step 7: yes to publishing the guide** at boa.tomd.org/guide/ after he has looked at it locally
-   (`boa dev`, then `boa --local new guide --title "Build your own little apps" --open --private`, `boa --local push guide guide`).
-   Then, for real: `boa new guide --title "Build your own little apps" --open --private`, `boa push guide guide`, `boa home guide`.
-2. **Step 8: yes to creating the public repo `tomdyson/boa`**, pushing and tagging `v1`. Then a card-free Cloudflare
-   account to rehearse the guide on.
-3. **His call, raised but not acted on:** what to do with the old guide at with.tomd.org/build-your-own-apps/ (one friend is
+1. **A card-free Cloudflare account to rehearse the guide on**, literally as a friend would (step 8, second half).
+   Not to be created by Claude.
+2. **His call, raised but not acted on:** what to do with the old guide at with.tomd.org/build-your-own-apps/ (one friend is
    partway through it and has hand-built his own version), and whether the guide should be removed from the dwa repo.
 
 ## Seen on the day
