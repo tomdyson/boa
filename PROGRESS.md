@@ -8,6 +8,13 @@ A short log so a new conversation can pick up. Newest state at the top of each l
   Same behaviour as dwa: password or open access, shared or private answers, visits, merge, live updates,
   one-time links with a Continue page, lockout, close and reopen, export, reset, delete. `node scripts/smoke.js --local` passes.
 
+- **Step 2, sign-ups.** Limits (named things with a fixed number of places) enforced in the app's Durable Object;
+  `book`, `cancel`, `left` in the browser library; a private change-or-cancel link after booking; 20 bookings a day
+  per address per app; a hidden field for bots; 60 writes per ten seconds per visitor. `boa settings`, `boa unbook`,
+  `boa data --csv`. Every visitor now gets a visitor cookie (it says whose bookings are whose).
+- **Step 3, owner page.** `<app>/_owner`, reached by a one-time link from `boa owner <app>`; tables that turn into
+  cards on a phone; CSV downloads; remove a booking; signed in for a year; `boa owner --signout` signs every device out.
+
 ## Differences from dwa worth knowing
 
 - Files are stored in the app's Durable Object in pieces of at most 1 MB (no R2). The command sends big files piece by piece.

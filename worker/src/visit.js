@@ -5,6 +5,7 @@
 //   sees anyone else's. The owner reads them all through the admin API.
 import { fingerprint, makeToken, readToken } from "./auth.js";
 import { FILE_RE, SESSION_DAYS, VISITOR_DAYS } from "./limits.js";
+import { owner } from "./owner.js";
 import { enterPage, linkExpiredPage, lockedPage, loginPage, notFoundPage, SEC_HEADERS } from "./pages.js";
 import CLIENT_JS from "./boa.client.js";
 
@@ -18,7 +19,7 @@ export const decode = (s) => {
     return null;
   }
 };
-const getCookie = (req, name) =>
+export const getCookie = (req, name) =>
   (req.headers.get("Cookie") || "").split(/;\s*/).find((c) => c.startsWith(name + "="))?.slice(name.length + 1);
 
 // A rough, human label for a visitor's browser ("Safari on iPhone"), for the owner's view of who visited.
@@ -36,7 +37,7 @@ function withCookie(res, cookie) {
   return r;
 }
 
-const redirect = (location, cookies = []) => {
+export const redirect = (location, cookies = []) => {
   const headers = new Headers({ Location: location, "Cache-Control": "no-store", ...SEC_HEADERS });
   for (const c of cookies) headers.append("Set-Cookie", c);
   return new Response(null, { status: 303, headers });
@@ -60,6 +61,9 @@ export async function visit(store, env, req) {
     `boa=${await makeToken(secret, { k: "session", s: slug, f: fp, e: Date.now() + SESSION_DAYS * 864e5 })}; ${attrs}; HttpOnly; Max-Age=${SESSION_DAYS * 86400}`;
   const visitorCookie = async (v) =>
     `boa_v=${await makeToken(secret, { k: "visitor", s: slug, v, e: Date.now() + VISITOR_DAYS * 864e5 })}; ${attrs}; HttpOnly; Max-Age=${VISITOR_DAYS * 86400}`;
+
+  // The owner's page has its own sign-in, separate from visitors' and from the password.
+  if (sub === "_owner" || sub.startsWith("_owner/")) return owner(store, env, req, { slug, sub: sub.slice("_owner".length + 1), url, title: gate.title, attrs });
 
   // An open app has no sign-in: its login route just leads to the page.
   if (gate.open && sub === "_login") return redirect(`/${slug}/`);

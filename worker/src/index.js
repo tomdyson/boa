@@ -152,6 +152,9 @@ async function admin(req, env, url, parts) {
     return result.error ? err(result.error, 404) : json(result);
   }
 
+  if (sub === "owner-links" && m === "POST") return json(await app.mintOwnerLink(slug, url.origin, (await req.json().catch(() => null)) || {}));
+  if (sub === "owner-sessions" && m === "DELETE") return json(await app.ownerSignOutEverywhere());
+
   if (sub === "links" && m === "POST") {
     const result = await app.mintLink(slug, url.origin, (await req.json().catch(() => null)) || {});
     return result.error ? err(result.error, 400) : json(result);

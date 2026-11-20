@@ -406,6 +406,26 @@ export class AppStore extends DurableObject {
     return { url: `${origin}/${slug}/_enter?t=${t}`, expires_at: new Date(payload.e).toISOString() };
   }
 
+  // --- the owner's page --------------------------------------------------------------------------
+
+  // Owner sign-ins carry this number. Raising it signs every device out and kills unused owner links.
+  ownerGen() {
+    return Number(this.#meta().owner_gen || 0);
+  }
+
+  ownerSignOutEverywhere() {
+    this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('owner_gen', ?)", String(this.ownerGen() + 1));
+    return { ok: true };
+  }
+
+  // One-time link to <app>/_owner. Used by pressing Continue, like a sign-in link.
+  async mintOwnerLink(slug, origin, body) {
+    const minutes = Math.min(Math.max(Number(body.minutes) || 30, 1), 24 * 60);
+    const payload = { k: "owner-enter", s: slug, g: this.ownerGen(), n: crypto.randomUUID(), e: Date.now() + minutes * 60e3 };
+    const t = await makeToken(this.env.SESSION_SECRET, payload);
+    return { url: `${origin}/${slug}/_owner/enter?t=${t}`, expires_at: new Date(payload.e).toISOString() };
+  }
+
   // --- files ------------------------------------------------------------------------------------
 
   listFiles() {

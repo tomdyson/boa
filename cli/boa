@@ -483,6 +483,24 @@ async function cmdUnbook(c, a) {
   console.log(`Removed ${r.removed.name}'s booking for ${r.removed.limit}.${left ? ` ${left.left} of ${left.places} places are now free.` : ""}\nNobody is told automatically: let them know yourself if they need to.`);
 }
 
+async function cmdOwner(c, a) {
+  const slug = a._[0];
+  if (a.signout) {
+    const slugs = slug ? [(await c.app(slug)) && slug] : (await c.call("GET", "/apps")).map((x) => x.slug);
+    for (const s of slugs) await c.call("DELETE", `/apps/${s}/owner-sessions`);
+    console.log(slug
+      ? `Every device is signed out of ${slug}'s owner page, and unused owner links for it no longer work.`
+      : `Every device is signed out of every owner page (${plural(slugs.length, "app")}), and unused owner links no longer work.`);
+    return;
+  }
+  if (!slug) die("usage: boa owner <app>   (or: boa owner --signout, to sign every device out)");
+  await c.app(slug);
+  const r = await c.call("POST", `/apps/${slug}/owner-links`, { json: { minutes: Number(a.minutes) || 30 } });
+  const u = new URL(r.url);
+  console.log(`${c.base}${u.pathname}${u.search}`);
+  console.error(`(for the owner only: works once, until ${when(r.expires_at)}; the device that opens it stays signed in for a year)`);
+}
+
 async function cmdPassword(c, a) {
   const slug = a._[0];
   await c.app(slug);
@@ -639,6 +657,7 @@ const COMMANDS = {
   push: ["<app> [folder] [--no-css]", "build the page's styles and publish the folder's files", cmdPush, [], ["no-css"], true],
   link: ["<app> [--as NAME] [--minutes M] [--visitor ID]", "a one-time sign-in link, for previews or instead of a password", cmdLink, ["as", "minutes", "visitor"], [], true],
   data: ["<app> [--history] [--csv [--answers]] [--json]", "show the answers and bookings: who, what, when", cmdData, [], ["history", "json", "csv", "answers"], true],
+  owner: ["[app] [--signout] [--minutes M]", "a one-time link to an app's owner page; --signout signs every device out", cmdOwner, ["minutes"], ["signout"], true],
   unbook: ["<app> <booking number>", "remove someone's booking (the numbers are in `boa data`)", cmdUnbook, [], [], true],
   ls: ["", "list the apps", cmdLs, [], [], true],
   info: ["<app>", "an app's address, password and status", cmdInfo, [], [], true],
@@ -696,7 +715,7 @@ async function main(argv) {
   if (argv.includes("--help")) return console.log(`boa ${name} ${args}\n  ${help}`);
   const a = parseArgs(argv.slice(1), values, bools, multi);
   a.local = local;
-  if (args.startsWith("<app>")) {
+  if (args.startsWith("<app>") || (args.startsWith("[app]") && a._[0])) {
     if (!a._[0]) die(`usage: boa ${name} ${args}`);
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(a._[0])) die(`"${a._[0]}" can't be an app's name: use lowercase letters, digits and hyphens (2 to 41 characters)`);
   }
