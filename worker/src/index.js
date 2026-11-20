@@ -146,6 +146,12 @@ async function admin(req, env, url, parts) {
     return result.error ? err(result.error, 400) : json(result);
   }
 
+  // Remove one booking, by its number (shown by `boa data`).
+  if (sub === "bookings" && rest.length === 1 && m === "DELETE") {
+    const result = await app.unbook(Number(rest[0]));
+    return result.error ? err(result.error, 404) : json(result);
+  }
+
   if (sub === "links" && m === "POST") {
     const result = await app.mintLink(slug, url.origin, (await req.json().catch(() => null)) || {});
     return result.error ? err(result.error, 400) : json(result);

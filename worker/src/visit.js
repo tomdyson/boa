@@ -95,49 +95,88 @@ export async function visit(store, env, req) {
 
   if (sub === "_logout") return redirect(`/${slug}/`, [`boa=; ${attrs}; HttpOnly; Max-Age=0`]);
 
+  // The private link shown after a booking. Like a one-time link, it does nothing until Continue is
+  // pressed; unlike one, it keeps working, so the person can come back to their booking.
+  if (sub === "_mine") {
+    const posted = req.method === "POST";
+    const t = posted ? String((await req.formData().catch(() => null))?.get("t") || "") : url.searchParams.get("t");
+    const p = await readToken(secret, t, "mine");
+    if (!p || p.s !== slug) return linkExpiredPage();
+    if (!posted) return enterPage(`/${slug}/_mine`, gate.title, t, "This link opens your own booking on this device, so you can change or cancel it.");
+    return redirect(`/${slug}/`, [await visitorCookie(p.v)]);
+  }
+
   if (!gate.open) {
     const p = await readToken(secret, getCookie(req, "boa"), "session");
     if (!(p && p.s === slug && p.f === fp)) return sub.startsWith("_api") ? err("unauthorised", 401) : loginPage(slug, gate.title);
   }
 
-  // Private apps: find this browser's visitor id, or give it one (the cookie is set on this response).
-  let visitor = null;
+  // Find this browser's visitor id, or give it one (the cookie is set on this response). It says
+  // which answers are theirs in a private app, and which bookings are theirs in any app.
   let newVisitorCookie = null;
-  if (gate.private) {
-    const p = await readToken(secret, getCookie(req, "boa_v"), "visitor");
-    visitor = p && p.s === slug ? p.v : null;
-    if (!visitor) {
-      if (sub === "_api/live") return err("no visitor", 401);
+  const p = await readToken(secret, getCookie(req, "boa_v"), "visitor");
+  let visitor = p && p.s === slug ? p.v : null;
+  if (!visitor) {
+    if (sub === "_api/live") {
+      if (gate.private) return err("no visitor", 401);
+    } else {
       visitor = crypto.randomUUID();
       newVisitorCookie = await visitorCookie(visitor);
     }
   }
-  const res = await serve(store, req, sub, visitor);
+  const res = await serve(store, req, { slug, sub, visitor, isPrivate: gate.private, origin: url.origin });
   return newVisitorCookie ? withCookie(res, newVisitorCookie) : res;
 }
 
-async function serve(store, req, sub, visitor) {
+// visitor: this browser. mine: the visitor whose answers these are, which is nobody in a shared app.
+async function serve(store, req, { slug, sub, visitor, isPrivate, origin }) {
+  const mine = isPrivate ? visitor : null;
+  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  const author = () => decode(req.headers.get("X-Boa-Author") || "");
+  const visitorInfo = () => {
+    const info = store.info();
+    // Private apps: how many others have answered is none of a visitor's business. Nor are bookings, anywhere.
+    if (isPrivate) for (const k of ["answers", "last_at", "visitors", "visited"]) delete info[k];
+    delete info.bookings;
+    return info;
+  };
+  const myBookings = async () => {
+    const bookings = store.myBookings(visitor);
+    return { bookings, link: bookings.length ? await store.mineLink(slug, origin, visitor) : null };
+  };
+
   if (sub === "_boa.js") {
     return new Response(CLIENT_JS, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "private, no-cache", ...SEC_HEADERS } });
   }
-  if (sub === "_api/info") {
-    const info = store.info();
-    // Private apps: how many others have answered is none of a visitor's business.
-    if (visitor) for (const k of ["answers", "last_at", "visitors", "visited"]) delete info[k];
-    return json(info);
+  // Everything a page needs when it opens, in one request.
+  if (sub === "_api/start") {
+    if (mine) store.recordVisit(mine, author(), deviceLabel(req.headers.get("User-Agent") || ""));
+    return json({ info: visitorInfo(), state: store.getState(mine), ...(await myBookings()) });
   }
+  if (sub === "_api/info") return json(visitorInfo());
   if (sub === "_api/state" && req.method === "GET") {
-    if (visitor) store.recordVisit(visitor, decode(req.headers.get("X-Boa-Author") || ""), deviceLabel(req.headers.get("User-Agent") || ""));
-    return json(store.getState(visitor));
+    if (mine) store.recordVisit(mine, author(), deviceLabel(req.headers.get("User-Agent") || ""));
+    return json(store.getState(mine));
   }
   if (sub.startsWith("_api/state/") && req.method === "PUT") {
+    if (store.tooFast(visitor, ip)) return err("too fast", 429);
     const key = sub.slice("_api/state/".length);
     const body = await req.json().catch(() => null);
     if (!body || !("value" in body)) return err("expected {value}", 400);
-    const author = decode(req.headers.get("X-Boa-Author") || "") || "anonymous";
-    const result = store.setState(key, body.value, author, false, visitor);
+    const result = store.setState(key, body.value, author() || "anonymous", false, mine);
     if (result.error) return err(result.error, result.error === "closed" ? 423 : 400);
     return json(result.row);
+  }
+  if (sub === "_api/bookings" && req.method === "GET") return json(await myBookings());
+  if (sub.startsWith("_api/book/")) {
+    const limit = sub.slice("_api/book/".length);
+    if (req.method !== "POST" && req.method !== "DELETE") return err("method not allowed", 405);
+    if (store.tooFast(visitor, ip)) return err("too fast", 429);
+    const result = req.method === "POST"
+      ? store.book(visitor, ip, limit, (await req.json().catch(() => null)) || {})
+      : store.cancelBooking(visitor, limit);
+    if (result.error) return err(result.error, result.status);
+    return json({ ...result, ...(await myBookings()) });
   }
   if (sub === "_api/live") {
     if (req.headers.get("Upgrade") !== "websocket") return err("expected websocket", 426);

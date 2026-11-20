@@ -19,6 +19,12 @@ export const LIMITS = {
   maxFileBytes: 25 * 1024 * 1024,
   maxAppBytes: 250 * 1024 * 1024,
   maxFiles: 2000,
+  // Sign-ups: named things with a fixed number of places.
+  limitPattern: /^[A-Za-z0-9][A-Za-z0-9_.-]{0,59}$/,
+  maxLimits: 200,
+  maxPlaces: 100000,
+  maxNote: 1000,
+  bookingsPerIpPerDay: 20,
 };
 
 export const SESSION_DAYS = 30;

@@ -214,6 +214,19 @@ function closingDate(days) {
   return `${d.toISOString().slice(0, 10)}T23:59:59Z`;
 }
 
+// --limit tuesday-yoga=12 (as many as needed) -> {"tuesday-yoga": 12}
+function parseLimits(list = []) {
+  const out = {};
+  for (const item of list) {
+    const m = String(item).match(/^([A-Za-z0-9][A-Za-z0-9_.-]{0,59})=(\d+)$/);
+    if (!m) die(`"${item}" isn't a limit: write it as name=places, for example tuesday-yoga=12`);
+    out[m[1]] = Number(m[2]);
+  }
+  return out;
+}
+
+const limitLines = (limits) => Object.entries(limits || {}).map(([name, l]) => `${name}: ${l.taken} of ${l.places} taken, ${l.left} left`);
+
 async function cmdNew(c, a) {
   const slug = a._[0];
   if (RESERVED.has(slug)) die(`"${slug}" is a name boa keeps for itself: pick another`);
@@ -221,11 +234,13 @@ async function cmdNew(c, a) {
   if (!a.title) die("give the app a title: --title \"Dinner dates\"");
   const password = a.password || passphrase();
   const expires = a.days ? closingDate(Number(a.days)) : null;
-  const r = await c.call("PUT", `/apps/${slug}`, { json: { title: a.title, password, expires_at: expires, open: Boolean(a.open), private: Boolean(a.private) } });
+  const limits = parseLimits(a.limit);
+  const r = await c.call("PUT", `/apps/${slug}`, { json: { title: a.title, password, expires_at: expires, open: Boolean(a.open), private: Boolean(a.private), limits } });
   savePassword(c.base, slug, password);
   const access = a.open ? "open: no password, anyone with the address can use it" : `password: ${password}`;
   const answers = a.private ? "private: each visitor sees only their own" : "shared: everyone sees everyone's";
   console.log(`Created ${c.base}/${slug}/\n  title:    ${r.title}\n  access:   ${access}\n  answers:  ${answers}\n  closes:   ${expires ? `${expires.slice(0, 10)} (read-only after)` : "when you close it"}`);
+  for (const line of limitLines(r.limits)) console.log(`  places:   ${line}`);
   console.log(`\nNext: \`boa push ${slug}\`, check it with \`boa link ${slug}\`, then share ${a.open ? "the address" : "the address and password"}.`);
 }
 
@@ -343,6 +358,7 @@ async function cmdData(c, a) {
   await c.app(slug);
   const x = await c.call("GET", `/apps/${slug}/export`);
   if (a.json) return console.log(JSON.stringify(x, null, 2));
+  if (a.csv) return console.log(a.answers || !Object.keys(x.info.limits || {}).length ? answersCsv(x) : bookingsCsv(x));
   const i = x.info;
   console.log(`${i.title} — ${c.base}/${slug}/ (${statusLine(i)})`);
   const priv = x.private_state || [];
@@ -367,10 +383,36 @@ async function cmdData(c, a) {
     console.log("\n" + bits.join(" · "));
     for (const r of rows) console.log(`  ${r.key}: ${fmtValue(r.value)}${r.author !== name ? ` — ${r.author}` : ""}`);
   }
+  const booked = groupBy(x.bookings || [], "limit");
+  for (const [name, l] of Object.entries(i.limits || {})) {
+    console.log(`\n${name}: ${l.taken} of ${l.places} places taken, ${l.left} left`);
+    for (const b of booked[name] || []) {
+      console.log(`  #${b.id}  ${b.name}${b.email ? ` <${b.email}>` : ""}, booked ${when(b.at)}${b.note ? `\n      note: ${fmtValue(b.note)}` : ""}`);
+    }
+  }
   if (a.history) {
     console.log("\nHistory (oldest first):");
     for (const h of x.history) console.log(`  ${when(h.at)}  ${h.visitor ? `${h.author} [${h.visitor.slice(0, 8)}]` : h.author}: ${h.key} = ${fmtValue(h.value)}`);
   }
+}
+
+// For a spreadsheet. A cell starting with = + - or @ would be run as a formula, so it gets a ' in front.
+function csv(rows) {
+  const cell = (v) => {
+    let s = v === null || v === undefined ? "" : typeof v === "string" ? v : JSON.stringify(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return rows.map((r) => r.map(cell).join(",")).join("\r\n");
+}
+
+const bookingsCsv = (x) =>
+  csv([["what", "name", "email", "note", "booked at", "booking number"], ...(x.bookings || []).map((b) => [b.limit, b.name, b.email, b.note, b.at, String(b.id)])]);
+
+function answersCsv(x) {
+  if (!x.info.private) return csv([["question", "answer", "who", "when"], ...x.state.map((r) => [r.key, r.value, r.author, r.at])]);
+  const names = Object.fromEntries((x.visits || []).map((v) => [v.visitor, v.name]));
+  return csv([["visitor", "name", "question", "answer", "when"], ...(x.private_state || []).map((r) => [r.visitor.slice(0, 8), names[r.visitor] || r.author, r.key, r.value, r.at])]);
 }
 
 async function resolveVisitor(c, slug, prefix) {
@@ -405,8 +447,40 @@ async function cmdInfo(c, a) {
   console.log(x.private
     ? `  private:  each visitor sees only their own answers (${plural(x.visited || 0, "visitor")} so far, ${x.visitors || 0} with answers)`
     : "  shared:   everyone who can open it sees every answer");
+  for (const line of limitLines(x.limits)) console.log(`  places:   ${line}`);
   const files = await c.call("GET", `/apps/${slug}/files`);
   console.log(`  files:    ${files.length} (${(files.reduce((n, f) => n + f.size, 0) / 1024).toFixed(0)} KB)`);
+}
+
+async function cmdSettings(c, a) {
+  const slug = a._[0];
+  await c.app(slug);
+  const body = {};
+  if (a.title) body.title = a.title;
+  if (a.private && a.shared) die("--private and --shared can't both be given");
+  if (a.private || a.shared) body.private = Boolean(a.private);
+  if (a.open) body.open = true;
+  if (a.closes) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(a.closes) || Number.isNaN(Date.parse(a.closes))) die("--closes needs a date like 2027-01-31");
+    body.expires_at = `${a.closes}T23:59:59Z`;
+  }
+  if (a["no-closing-date"]) body.expires_at = null;
+  const limits = { ...parseLimits(a.limit), ...Object.fromEntries((a["remove-limit"] || []).map((n) => [n, null])) };
+  if (Object.keys(limits).length) body.limits = limits;
+  if (Object.keys(body).length) await c.call("PUT", `/apps/${slug}`, { json: body });
+  else console.log("Nothing changed. Options: --title, --private, --shared, --open, --limit name=places, --remove-limit name, --closes DATE, --no-closing-date.\n");
+  await cmdInfo(c, a);
+}
+
+async function cmdUnbook(c, a) {
+  const [slug, number] = a._;
+  const id = Number(String(number || "").replace(/^#/, ""));
+  if (!Number.isInteger(id) || id < 1) die(`usage: boa unbook <app> <booking number>  (\`boa data ${slug}\` shows the numbers)`);
+  await c.app(slug);
+  const r = await c.call("DELETE", `/apps/${slug}/bookings/${id}`, { missingOk: true });
+  if (!r) die(`${slug} has no booking number ${id} (\`boa data ${slug}\` shows them)`);
+  const left = r.limits[r.removed.limit];
+  console.log(`Removed ${r.removed.name}'s booking for ${r.removed.limit}.${left ? ` ${left.left} of ${left.places} places are now free.` : ""}\nNobody is told automatically: let them know yourself if they need to.`);
 }
 
 async function cmdPassword(c, a) {
@@ -560,10 +634,12 @@ function cmdDeploy() {
 
 // name: [usage, one-line help, function, {flags that take a value}, {flags that don't}, needs a Worker?]
 const COMMANDS = {
-  new: ["<app> --title T [--open] [--private] [--days N] [--password P]", "create an app (a password is made up unless it's open)", cmdNew, ["title", "password", "days"], ["open", "private"], true],
+  new: ["<app> --title T [--open] [--private] [--limit name=places]... [--days N] [--password P]", "create an app (a password is made up unless it's open)", cmdNew, ["title", "password", "days"], ["open", "private"], true, ["limit"]],
+  settings: ["<app> [--title T] [--private|--shared] [--open] [--limit name=places]... [--remove-limit name]... [--closes DATE|--no-closing-date]", "show or change an app's settings", cmdSettings, ["title", "closes"], ["private", "shared", "open", "no-closing-date"], true, ["limit", "remove-limit"]],
   push: ["<app> [folder] [--no-css]", "build the page's styles and publish the folder's files", cmdPush, [], ["no-css"], true],
   link: ["<app> [--as NAME] [--minutes M] [--visitor ID]", "a one-time sign-in link, for previews or instead of a password", cmdLink, ["as", "minutes", "visitor"], [], true],
-  data: ["<app> [--history] [--json]", "show the answers: who, what, when", cmdData, [], ["history", "json"], true],
+  data: ["<app> [--history] [--csv [--answers]] [--json]", "show the answers and bookings: who, what, when", cmdData, [], ["history", "json", "csv", "answers"], true],
+  unbook: ["<app> <booking number>", "remove someone's booking (the numbers are in `boa data`)", cmdUnbook, [], [], true],
   ls: ["", "list the apps", cmdLs, [], [], true],
   info: ["<app>", "an app's address, password and status", cmdInfo, [], [], true],
   set: ["<app> <key> <value> [--as NAME] [--visitor ID]", "write an answer as the owner (works when closed)", cmdSet, ["as", "visitor"], [], true],
@@ -588,7 +664,7 @@ function usage() {
     `\n\nAdd --local to any command to use the practice copy started by \`boa dev\`.`;
 }
 
-function parseArgs(argv, values, bools) {
+function parseArgs(argv, values, bools, multi = []) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -598,10 +674,11 @@ function parseArgs(argv, values, bools) {
     }
     const [name, inline] = arg.slice(2).split(/=(.*)/s);
     if (bools.includes(name)) out[name] = true;
-    else if (values.includes(name)) {
+    else if (values.includes(name) || multi.includes(name)) {
       const v = inline !== undefined ? inline : argv[++i];
       if (v === undefined) die(`--${name} needs a value`);
-      out[name] = v;
+      if (multi.includes(name)) (out[name] ||= []).push(v);
+      else out[name] = v;
     } else die(`unknown option --${name}`);
   }
   return out;
@@ -615,9 +692,9 @@ async function main(argv) {
   if (name === "--version" || name === "version") return console.log(VERSION);
   const cmd = COMMANDS[name];
   if (!cmd) die(`there is no "${name}" command. Run \`boa help\` for the list.`);
-  const [args, help, fn, values, bools, needsWorker] = cmd;
+  const [args, help, fn, values, bools, needsWorker, multi] = cmd;
   if (argv.includes("--help")) return console.log(`boa ${name} ${args}\n  ${help}`);
-  const a = parseArgs(argv.slice(1), values, bools);
+  const a = parseArgs(argv.slice(1), values, bools, multi);
   a.local = local;
   if (args.startsWith("<app>")) {
     if (!a._[0]) die(`usage: boa ${name} ${args}`);

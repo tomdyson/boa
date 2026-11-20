@@ -3,12 +3,14 @@
 // (see visit.js), so one page request costs one Durable Object request. A single Registry lists the apps.
 import { DurableObject } from "cloudflare:workers";
 import { checkPassword, fingerprint, hashPassword, makeToken } from "./auth.js";
-import { LIMITS, VISITOR_RE } from "./limits.js";
+import { LIMITS, VISITOR_DAYS, VISITOR_RE } from "./limits.js";
 import { visit } from "./visit.js";
 
 const VISIT_GAP_MS = 30 * 60e3; // loads closer together than this are one visit
 const LOCKOUT = { perIp: 10, ipWindowMs: 15 * 60e3, perApp: 200, appWindowMs: 60 * 60e3 };
 const STALE_UPLOAD_MS = 60 * 60e3;
+// Saves and bookings: at most this many in each ten seconds.
+const RATE = { windowMs: 10e3, perVisitor: 60, perIp: 300 };
 
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
@@ -39,6 +41,10 @@ export class AppStore extends DurableObject {
       CREATE TABLE IF NOT EXISTS file_pieces (path TEXT NOT NULL, seq INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (path, seq));
       CREATE TABLE IF NOT EXISTS upload_pieces (upload TEXT NOT NULL, seq INTEGER NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL,
                                                 PRIMARY KEY (upload, seq));
+      CREATE TABLE IF NOT EXISTS limits (name TEXT PRIMARY KEY, places INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, limit_name TEXT NOT NULL, visitor TEXT NOT NULL,
+                                           name TEXT NOT NULL, email TEXT, note TEXT, at TEXT NOT NULL, UNIQUE (limit_name, visitor));
+      CREATE TABLE IF NOT EXISTS booking_ips (ip TEXT NOT NULL, at INTEGER NOT NULL);
     `);
     this.live = true;
   }
@@ -98,6 +104,8 @@ export class AppStore extends DurableObject {
       visited,
       answers: stats.answers,
       last_at: stats.last_at,
+      limits: this.limitsInfo(),
+      bookings: this.sql.exec("SELECT count(*) AS n FROM bookings").one().n,
     };
   }
 
@@ -115,7 +123,20 @@ export class AppStore extends DurableObject {
     if (body.closed !== undefined) patch.closed = body.closed ? "1" : null;
     if (body.open !== undefined) patch.open = body.open ? "1" : null;
     if (body.private !== undefined) patch.private = body.private ? "1" : null;
+    const limits = Object.entries(body.limits || {});
+    for (const [name, places] of limits) {
+      if (!LIMITS.limitPattern.test(name)) return { error: `bad limit name "${name}": letters, digits, hyphens, dots and underscores, 60 at most` };
+      if (places !== null && !(Number.isInteger(places) && places >= 0 && places <= LIMITS.maxPlaces)) return { error: `"${name}" needs a whole number of places` };
+      if (places === null && exists && this.sql.exec("SELECT 1 FROM bookings WHERE limit_name = ? LIMIT 1", name).toArray().length) {
+        return { error: `"${name}" still has bookings: remove them first` };
+      }
+    }
     if (!this.live) this.#schema();
+    for (const [name, places] of limits) {
+      if (places === null) this.sql.exec("DELETE FROM limits WHERE name = ?", name);
+      else this.sql.exec("INSERT OR REPLACE INTO limits VALUES (?, ?)", name, places);
+    }
+    if (this.sql.exec("SELECT count(*) AS n FROM limits").one().n > LIMITS.maxLimits) return { error: "too many limits in one app" };
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined) continue;
       if (v === null) this.sql.exec("DELETE FROM meta WHERE k = ?", k);
@@ -139,7 +160,7 @@ export class AppStore extends DurableObject {
   // private answers, seen and pushed live only to them.
   setState(key, value, author, force = false, visitor = null) {
     if (!force && this.#isClosed(this.#meta())) return { error: "closed" };
-    if (!LIMITS.keyPattern.test(key)) return { error: "bad key" };
+    if (!LIMITS.keyPattern.test(key) || key.startsWith("booking:")) return { error: "bad key" };
     if (visitor !== null && !VISITOR_RE.test(visitor)) return { error: "bad visitor" };
     visitor = this.#canon(visitor);
     const v = JSON.stringify(value === undefined ? null : value);
@@ -168,9 +189,9 @@ export class AppStore extends DurableObject {
     return { row };
   }
 
-  // Clears answers and history, shared and private (after testing, before sharing). Settings and files stay.
+  // Clears answers, bookings and history (after testing, before sharing). Settings, limits and files stay.
   clearState() {
-    this.sql.exec("DELETE FROM state; DELETE FROM pstate; DELETE FROM history; DELETE FROM visits; DELETE FROM aliases;");
+    this.sql.exec("DELETE FROM state; DELETE FROM pstate; DELETE FROM history; DELETE FROM visits; DELETE FROM aliases; DELETE FROM bookings; DELETE FROM booking_ips;");
     this.#broadcast({ type: "reset" });
     return { ok: true };
   }
@@ -181,7 +202,8 @@ export class AppStore extends DurableObject {
     const private_state = this.sql.exec("SELECT visitor, key, value, author, at FROM pstate ORDER BY visitor, key").toArray().map(parse);
     const visits = this.sql.exec("SELECT visitor, first_at, last_at, visits, name, device FROM visits ORDER BY first_at").toArray();
     const merged = this.sql.exec("SELECT visitor, target, at FROM aliases ORDER BY at").toArray();
-    return { info: this.info(), state: this.getState(), private_state, visits, history, merged };
+    const bookings = this.sql.exec("SELECT id, limit_name AS \"limit\", name, email, note, at, visitor FROM bookings ORDER BY limit_name, id").toArray();
+    return { info: this.info(), state: this.getState(), private_state, visits, bookings, history, merged };
   }
 
   // Private apps: one person who used two browsers (phone and laptop) shows up as two visitors.
@@ -199,6 +221,9 @@ export class AppStore extends DurableObject {
       into, from);
     this.sql.exec("DELETE FROM pstate WHERE visitor = ?", from);
     this.sql.exec("UPDATE history SET visitor = ? WHERE visitor = ?", into, from);
+    // Bookings move too; where both browsers booked the same thing, the one being kept wins and a place is freed.
+    this.sql.exec("UPDATE OR IGNORE bookings SET visitor = ? WHERE visitor = ?", into, from);
+    this.sql.exec("DELETE FROM bookings WHERE visitor = ?", from);
     const a = this.sql.exec("SELECT * FROM visits WHERE visitor = ?", from).toArray()[0];
     const b = this.sql.exec("SELECT * FROM visits WHERE visitor = ?", into).toArray()[0];
     if (a && b) {
@@ -238,6 +263,101 @@ export class AppStore extends DurableObject {
       this.sql.exec("UPDATE visits SET last_at = ?, visits = visits + ?, name = coalesce(?, name), device = coalesce(?, device) WHERE visitor = ?",
         now.toISOString(), bump, nm, dev, visitor);
     }
+  }
+
+  // --- places and bookings -------------------------------------------------------------------------
+
+  // {name: {places, taken, left}} for every limit. Counts only: safe to show any visitor.
+  limitsInfo() {
+    const out = {};
+    for (const r of this.sql.exec("SELECT l.name, l.places, (SELECT count(*) FROM bookings b WHERE b.limit_name = l.name) AS taken FROM limits l ORDER BY l.name")) {
+      out[r.name] = { places: r.places, taken: r.taken, left: Math.max(0, r.places - r.taken) };
+    }
+    return out;
+  }
+
+  #bookingChanged(visitor, key, value, who) {
+    this.sql.exec("INSERT INTO history (key, value, author, at, visitor) VALUES (?, ?, ?, ?, ?)", key, JSON.stringify(value), who, new Date().toISOString(), visitor);
+    this.#broadcast({ type: "places", limits: this.limitsInfo() });
+    this.#broadcast({ type: "bookings" }, visitor);
+  }
+
+  myBookings(visitor) {
+    visitor = this.#canon(visitor);
+    return this.sql.exec("SELECT limit_name AS \"limit\", name, email, note, at FROM bookings WHERE visitor = ? ORDER BY limit_name", visitor).toArray();
+  }
+
+  // Take a place. Everything from the count to the insert happens without a pause, and this object
+  // handles one request at a time, so two people can never both take the last place.
+  // Booking again changes the details of the booking you already have.
+  book(visitor, ip, limit, details) {
+    if (this.#isClosed(this.#meta())) return { error: "closed", status: 423 };
+    if (!VISITOR_RE.test(visitor || "")) return { error: "bad visitor", status: 400 };
+    visitor = this.#canon(visitor);
+    // The hidden field: people never see it, so only a program filling in every box sends it.
+    if (details.trap) return { error: "not accepted", status: 400 };
+    const name = String(details.name ?? "").trim();
+    const email = String(details.email ?? "").trim();
+    const note = String(details.note ?? "").trim();
+    if (!name || name.length > LIMITS.maxAuthor) return { error: "a name is needed", status: 400 };
+    if (email && (email.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return { error: "that email address doesn't look right", status: 400 };
+    if (note.length > LIMITS.maxNote) return { error: "that note is too long", status: 400 };
+    const row = this.sql.exec("SELECT places FROM limits WHERE name = ?", limit).toArray()[0];
+    if (!row) return { error: "nothing here to book", status: 404 };
+    const at = new Date().toISOString();
+    const mine = this.sql.exec("SELECT id FROM bookings WHERE limit_name = ? AND visitor = ?", limit, visitor).toArray()[0];
+    if (mine) {
+      this.sql.exec("UPDATE bookings SET name = ?, email = ?, note = ? WHERE id = ?", name, email || null, note || null, mine.id);
+      this.#bookingChanged(visitor, `booking:${limit}`, { event: "changed", id: mine.id, name, email, note }, name);
+      return { booking: this.myBookings(visitor).find((b) => b.limit === limit), limits: this.limitsInfo() };
+    }
+    const now = Date.now();
+    this.sql.exec("DELETE FROM booking_ips WHERE at < ?", now - 864e5);
+    if (this.sql.exec("SELECT count(*) AS n FROM booking_ips WHERE ip = ?", ip).one().n >= LIMITS.bookingsPerIpPerDay) return { error: "too many bookings today", status: 429 };
+    if (this.sql.exec("SELECT count(*) AS n FROM bookings WHERE limit_name = ?", limit).one().n >= row.places) return { error: "full", status: 409 };
+    const id = this.sql.exec("INSERT INTO bookings (limit_name, visitor, name, email, note, at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id", limit, visitor, name, email || null, note || null, at).one().id;
+    this.sql.exec("INSERT INTO booking_ips VALUES (?, ?)", ip, now);
+    this.#bookingChanged(visitor, `booking:${limit}`, { event: "booked", id, name, email, note }, name);
+    return { booking: { limit, name, email: email || null, note: note || null, at }, limits: this.limitsInfo() };
+  }
+
+  cancelBooking(visitor, limit) {
+    if (this.#isClosed(this.#meta())) return { error: "closed", status: 423 };
+    visitor = this.#canon(visitor);
+    const row = this.sql.exec("DELETE FROM bookings WHERE limit_name = ? AND visitor = ? RETURNING id, name", limit, visitor || "").toArray()[0];
+    if (!row) return { error: "no booking to cancel", status: 404 };
+    this.#bookingChanged(visitor, `booking:${limit}`, { event: "cancelled", id: row.id, name: row.name }, row.name);
+    return { ok: true, limits: this.limitsInfo() };
+  }
+
+  // The owner removes someone's booking (by its number). Works when the app is closed.
+  unbook(id, by = "Owner") {
+    const row = this.sql.exec("DELETE FROM bookings WHERE id = ? RETURNING limit_name, visitor, name, email", id).toArray()[0];
+    if (!row) return { error: "no booking with that number" };
+    this.#bookingChanged(row.visitor, `booking:${row.limit_name}`, { event: "removed", id, name: row.name }, by);
+    return { ok: true, removed: { id, limit: row.limit_name, name: row.name, email: row.email }, limits: this.limitsInfo() };
+  }
+
+  // The private link shown after booking: it carries the visitor's id to another device.
+  async mineLink(slug, origin, visitor) {
+    const t = await makeToken(this.env.SESSION_SECRET, { k: "mine", s: slug, v: this.#canon(visitor), e: Date.now() + VISITOR_DAYS * 864e5 });
+    return `${origin}/${slug}/_mine?t=${t}`;
+  }
+
+  // Holding back a visitor (or one address) that writes too fast. Kept in memory only: it is
+  // allowed to forget when the app goes quiet.
+  #writes = new Map();
+  tooFast(visitor, ip) {
+    const now = Date.now();
+    if (this.#writes.size > 5000) this.#writes.clear();
+    let slow = false;
+    for (const [key, max] of [[`v:${visitor}`, RATE.perVisitor], [`i:${ip}`, RATE.perIp]]) {
+      if (key === "v:null") continue;
+      const w = this.#writes.get(key);
+      if (!w || now - w.start > RATE.windowMs) this.#writes.set(key, { start: now, n: 1 });
+      else if (++w.n > max) slow = true;
+    }
+    return slow;
   }
 
   // --- signing in -------------------------------------------------------------------------------
@@ -361,8 +481,9 @@ export class AppStore extends DurableObject {
     return visit(this, this.env, req);
   }
 
-  // Live updates. Private apps tag the socket with the visitor, so that visitor's changes reach
-  // only their own tabs. Hibernatable sockets: an idle app with open tabs costs nothing.
+  // Live updates. Each socket is tagged with its visitor, so private answers and news of a
+  // visitor's own bookings reach only their own tabs. Hibernatable sockets: an idle app with open
+  // tabs costs nothing.
   acceptSocket(visitor) {
     visitor = this.#canon(visitor);
     const [client, server] = Object.values(new WebSocketPair());

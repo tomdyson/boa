@@ -144,9 +144,11 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
   const tag = crypto.randomBytes(3).toString("hex");
   const s1 = `check-${tag}`;
   const s2 = `check-${tag}-b`;
+  const s3 = `check-${tag}-c`;
+  const s4 = `check-${tag}-d`;
   const pw = `pw-${crypto.randomBytes(8).toString("hex")}`;
   const pw2 = `pw-${crypto.randomBytes(8).toString("hex")}`;
-  const made = [s1, s2];
+  const made = [s1, s2, s3, s4];
   const admin = (method, p, body) => site.req(method, `/_admin${p}`, { admin: true, body });
   const exported = async (slug = s1) => (await admin("GET", `/apps/${slug}/export`)).json();
   // Use a one-time link as a person does: the Continue button on the page it opens posts its token.
@@ -159,7 +161,7 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     return `${u.pathname}${u.search}`;
   };
 
-  log(`Checking ${site.url.host}: test apps ${s1} and ${s2}`);
+  log(`Checking ${site.url.host}: test apps ${s1} and three more like it`);
   try {
     section("the owner's key");
     check("no key -> refused", (await site.req("GET", "/_admin/apps")).status === 401);
@@ -401,6 +403,92 @@ async function run(base, token, { quiet = false, log = console.log } = {}) {
     const nVisits = (await exported()).visits.length;
     await state(b.jar);
     check("shared apps record no visits", (await exported()).visits.length === nVisits);
+
+    section("sign-ups: limited places");
+    r = await admin("PUT", `/apps/${s3}`, { title: "Check sign-up", password: pw, open: true, private: true, limits: { yoga: 2, solo: 1 } });
+    check("create a sign-up app with limits", r.status === 200 && r.json().limits?.yoga?.left === 2, r.json());
+    check("a limit needs a whole number of places", (await admin("PUT", `/apps/${s3}`, { limits: { yoga: "lots" } })).status === 400);
+    // A new browser on an open app: its first request hands it a visitor cookie.
+    const fresh = async (slug = s3) => ({ Cookie: pair(cookieFrom(await site.req("GET", `/${slug}/_api/info`), "boa_v")) });
+    const book = (jar, limit, details, slug = s3) => site.req("POST", `/${slug}/_api/book/${limit}`, { body: details, headers: jar });
+    const cancel = (jar, limit, slug = s3) => site.req("DELETE", `/${slug}/_api/book/${limit}`, { headers: jar });
+    const mine = async (jar, slug = s3) => (await site.req("GET", `/${slug}/_api/bookings`, { headers: jar })).json();
+    const places = async (slug = s3) => (await site.req("GET", `/${slug}/_api/info`)).json().limits;
+    const ann = await fresh();
+    const bob = await fresh();
+    const bobSock = await site.ws(`/${s3}/_api/live`, bob.Cookie);
+    r = await book(ann, "yoga", { name: "Ann", email: "ann@example.com", note: "First time" });
+    check("book a place", r.status === 200 && r.json().booking?.name === "Ann" && r.json().limits?.yoga?.left === 1, [r.status, r.text.slice(0, 120)]);
+    const annLink = r.json().link || "";
+    check("booking gives a private link for changing or cancelling", annLink.includes(`/${s3}/_mine?t=`), annLink.slice(0, 60));
+    msg = JSON.parse((await bobSock.read()) || "{}");
+    check("everyone's page hears that a place has gone", msg.type === "places" && msg.limits?.yoga?.left === 1, msg);
+    bobSock.close();
+    check("the booker sees their own booking", (await mine(ann)).bookings?.[0]?.email === "ann@example.com");
+    const bobView = await mine(bob);
+    check("nobody else sees it, only how many places are left", bobView.bookings?.length === 0 && bobView.link === null && (await places()).yoga.left === 1, bobView);
+    info = (await site.req("GET", `/${s3}/_api/info`, { headers: bob })).json();
+    check("visitors aren't told how many bookings there are, or who made them", !("bookings" in info) && !JSON.stringify(info).includes("Ann"), info);
+    check("booking without a name -> refused", (await book(bob, "yoga", { email: "bob@example.com" })).status === 400);
+    check("booking with a bad email address -> refused", (await book(bob, "yoga", { name: "Bob", email: "not-an-address" })).status === 400);
+    check("booking something that doesn't exist -> refused", (await book(bob, "pilates", { name: "Bob" })).status === 404);
+    r = await book(bob, "yoga", { name: "Bot", email: "bot@example.com", trap: "http://spam.example" });
+    check("the hidden field only bots fill in -> refused, and no place taken", r.status === 400 && (await places()).yoga.left === 1, r.status);
+    r = await book(ann, "yoga", { name: "Ann Lee", email: "ann@example.com" });
+    check("booking again changes the details and takes no second place", r.status === 200 && r.json().booking?.name === "Ann Lee" && (await places()).yoga.taken === 1, r.text.slice(0, 120));
+    check("a visitor can't write over booking records", (await site.req("PUT", `/${s3}/_api/state/${encodeURIComponent("booking:yoga")}`, { body: { value: 1 }, headers: ann })).status === 400);
+
+    // Eight people go for the one place at the same moment.
+    const racers = await Promise.all(Array.from({ length: 8 }, () => fresh()));
+    const results = await Promise.all(racers.map((jar, i) => book(jar, "solo", { name: `Racer ${i}` })));
+    const won = results.filter((res) => res.status === 200).length;
+    const full = results.filter((res) => res.status === 409).length;
+    check("eight people racing for the last place: exactly one gets it", won === 1 && full === 7 && (await places()).solo.taken === 1, results.map((res) => res.status));
+
+    r = await site.req("GET", new URL(annLink).pathname + new URL(annLink).search);
+    check("opening the private link shows Continue and changes nothing", r.status === 200 && r.text.includes("Continue") && !cookieFrom(r, "boa_v"), r.status);
+    r = await site.req("POST", `/${s3}/_mine`, { form: { t: new URL(annLink).searchParams.get("t") } });
+    const annPhone = { Cookie: pair(cookieFrom(r, "boa_v")) };
+    check("Continue opens that booking on another device", r.status === 303 && (await mine(annPhone)).bookings?.[0]?.name === "Ann Lee", r.status);
+    check("a tampered private link -> expired", (await site.req("POST", `/${s3}/_mine`, { form: { t: new URL(annLink).searchParams.get("t").slice(0, -3) + "AAA" } })).status === 410);
+
+    x = await exported(s3);
+    const annBooking = x.bookings.find((bk) => bk.name === "Ann Lee");
+    check("the owner's export lists every booking with its number", x.bookings.length === 2 && annBooking?.id > 0 && annBooking.limit === "yoga", x.bookings);
+    check("history records each booking and change", x.history.filter((h) => h.key === "booking:yoga").map((h) => h.value.event).join() === "booked,changed", x.history.map((h) => h.key));
+    check("removing a limit that has bookings -> refused", (await admin("PUT", `/apps/${s3}`, { limits: { yoga: null } })).status === 400);
+    await admin("PUT", `/apps/${s3}`, { limits: { yoga: 1 } });
+    check("fewer places than bookings: nobody loses theirs, none are left", (await places()).yoga.left === 0 && (await book(bob, "yoga", { name: "Bob" })).status === 409);
+    await admin("PUT", `/apps/${s3}`, { limits: { yoga: 2 } });
+    const annSock = await site.ws(`/${s3}/_api/live`, ann.Cookie);
+    r = await admin("DELETE", `/apps/${s3}/bookings/${annBooking?.id}`);
+    check("the owner removes a booking", r.status === 200 && r.json().removed?.name === "Ann Lee" && (await places()).yoga.left === 2, r.text.slice(0, 120));
+    const heard = [JSON.parse((await annSock.read()) || "{}").type, JSON.parse((await annSock.read()) || "{}").type];
+    check("the booker's open page hears it has gone", heard.includes("bookings") && (await mine(ann)).bookings.length === 0, heard);
+    annSock.close();
+    check("removing a booking that isn't there -> not found", (await admin("DELETE", `/apps/${s3}/bookings/999999`)).status === 404);
+    await book(bob, "yoga", { name: "Bob" });
+    check("cancel a booking", (await cancel(bob, "yoga")).status === 200 && (await places()).yoga.left === 2);
+    check("cancelling twice -> nothing to cancel", (await cancel(bob, "yoga")).status === 404);
+    await book(bob, "yoga", { name: "Bob" });
+    await admin("PUT", `/apps/${s3}`, { closed: true });
+    check("closed: no booking or cancelling", (await book(ann, "yoga", { name: "Ann" })).status === 423 && (await cancel(bob, "yoga")).status === 423);
+    await admin("PUT", `/apps/${s3}`, { closed: false });
+    await admin("DELETE", `/apps/${s3}/state`);
+    x = await exported(s3);
+    check("reset clears the bookings and keeps the limits", x.bookings.length === 0 && x.info.limits.yoga.left === 2 && x.info.limits.solo.left === 1, x.info.limits);
+
+    section("sign-ups: holding back floods");
+    await admin("PUT", `/apps/${s4}`, { title: "Check flood", password: pw, open: true, limits: { hall: 30 } });
+    let accepted = 0;
+    for (let i = 0; i < 20; i++) if ((await book(await fresh(s4), "hall", { name: `Guest ${i}` }, s4)).status === 200) accepted++;
+    r = await book(await fresh(s4), "hall", { name: "Guest 21" }, s4);
+    check("one internet address can make 20 bookings a day on an app, not 21", accepted === 20 && r.status === 429 && (await places(s4)).hall.taken === 20, [accepted, r.status]);
+    const eager = await fresh(s4);
+    const burst = await Promise.all(Array.from({ length: 70 }, (_, i) =>
+      site.req("PUT", `/${s4}/_api/state/flood.${i}`, { body: { value: i }, headers: { ...eager, "X-Boa-Author": "Eager" } })));
+    const slowed = burst.filter((res) => res.status === 429).length;
+    check("70 saves at once from one visitor: the first 60 land, the rest are told to slow down", slowed === 10 && burst.filter((res) => res.status === 200).length === 60, burst.map((res) => res.status).join(" ").slice(0, 80));
 
     section("changing the password");
     await admin("PUT", `/apps/${s1}`, { password: `${pw}-new` });
